@@ -15,11 +15,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-i', '--input_file', type=str) #path to big fastq file from catting fastq_pass
 parser.add_argument('-o', '--output_path', type=str) #where you want temp output files and final combined R2C2_Consensus.fasta to go
 parser.add_argument('-s', '--splint', type=str) #path to 10x_UMI_splint.fasta
+parser.add_argument('-n', '--threads', type=int, default=20) #threads passed to each C3POa_sc.py run
+parser.add_argument('-c', '--config', type=str, default='') #optional config file passed through to C3POa_sc.py
 
 args = parser.parse_args()
 input_file=args.input_file
 path=args.output_path
 splint=args.splint
+threads=args.threads
+config=args.config
+
+#C3POa_sc.py lives next to this script
+C3POA_SC = '/'.join(os.path.realpath(__file__).split('/')[:-1]) + '/C3POa_sc.py'
 
 #define max number of reads per file
 groupsize=5000000
@@ -79,7 +86,10 @@ def c3poa(input_path,splint):
         os.mkdir(input_path+file+'_/')
         reads=input_path+file
         output=input_path+file+'_/'
-        os.system('/atium/Data/projects/sheridansinglecell/testing/./C3POa_sc.py -n 20 -r %s -o %s -s %s' %(reads, output,splint))
+        cmd = '%s -n %d -r %s -o %s -s %s' %(C3POA_SC, threads, reads, output, splint)
+        if config:
+            cmd += ' -c %s' %(config)
+        os.system(cmd)
 
 total_iters,target,lines=get_iters(input_file, groupsize)
 make_chunks(input_file,total_iters,target,lines,temp_dir)

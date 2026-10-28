@@ -30,7 +30,7 @@ gtf=args.gtf_file
 '''Parse config'''
 def configReader(configIn):
     progs = {}
-    for line in open(configIn): 
+    for line in (open(configIn) if configIn else []): #no -c given: use executables in $PATH 
         if line.startswith('#') or not line.rstrip().split():
             continue
         line = line.rstrip().split('\t') 

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyc.*
+
+# conk build artifacts
+conk-master/build/
+conk-master/dist/
+conk-master/*.egg-info/
+conk-master/conk/conk.c
+*.so
