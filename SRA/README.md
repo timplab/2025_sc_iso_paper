@@ -29,30 +29,30 @@ duplicate and should not be used.
   SMRT cell, so the submission has one BAM → one SRA run → one experiment per sample.
 - The `@RG SM` tag in every BAM matches the sample prefix of its filename (checked).
 - There is no PacBio data for NC1.
-- **NC2 (60 MB) and NC4 (30 MB, 6,257 reads) are far smaller than the others** (1–15 GB each).
+- NC2 (60 MB) and NC4 (30 MB, 6,257 reads) are far smaller than the others
+  (1–15 GB each), because their Kinnex prep failed (see Decisions).
 
 We submit these raw HiFi BAMs, not the skera-segmented or Iso-Seq-processed BAMs in
 `pacbio/<sample>/`. SRA prefers the least-processed form, and anyone can redo
 segmentation with `skera split`. We should note this in the design description,
 which the draft does.
 
-## Decisions to make before submitting
+## Decisions (confirmed with Sheridan, 2026-10-28)
 
-1. **Same BioSamples?** The draft assumes the Kinnex libraries were made from the
-   same 10X cDNA and animals as the ONT runs. If so, the new runs attach to the
-   existing SAMN accessions and no new BioSamples are needed. If they came from new
-   animals or tissue, we need new BioSamples, and the metadata sheet changes.
-2. **NC2 / NC4**: submit them anyway (recommended if they are used anywhere in the
-   paper), or drop them.
-3. **pool_1**: FC1, FC5, NC5 and UC4 come from a repeat run (`pool_1_rpt`). Was there
-   an original pool_1 SMRT cell? If it has usable data, it should be a second run
-   under the same experiments.
-4. **Release date**: immediately (the project is already public), or hold until
-   publication.
+1. **BioSamples**: the Kinnex libraries come from the same samples as the ONT runs,
+   so the new runs attach to the existing SAMN accessions as drafted.
+2. **NC2 / NC4**: the Kinnex prep for these two failed, so the tiny files are
+   expected. The other naive samples carried the analysis. They stay in the
+   submission as they are, so the deposited data covers all the PacBio runs.
+3. **pool_1**: the original pool_1 SMRT cell cracked at the sequencing core and gave
+   no usable data. `pool_1_rpt` was the core's free rerun, so there's nothing else
+   to submit.
+4. **Release**: immediately.
 
 ## Steps
 
-1. **Pre-flight check** (quickcheck, check SM tag against library_ID, md5):
+1. **Pre-flight check** (quickcheck, check SM tag against library_ID, md5). Done
+   2026-10-28: all 16 BAMs pass (`check_bams.log`, `md5sums.txt`).
    ```
    ./check_bams.sh /atium/Data/projects/sheridansinglecell/pacbio/261006_sherbear_pacbio_kinnex_bams \
        /home/timp/miniforge3/envs/240811_bcmb/bin/samtools
@@ -83,7 +83,7 @@ which the draft does.
    - BioSample: *Yes, existing* → the accessions are in the metadata sheet
    - SRA metadata: upload `pacbio_sra_metadata.tsv`
    - Files: *FTP or Aspera Command Line preload* → select `pacbio_kinnex`
-   - Release date as decided above → Submit
+   - Release date: immediately → Submit
 
 5. **After SRA processes the submission** (usually a day or two):
    - Check that 16 new SRR runs show up on SRP648294 and that their spot counts
