@@ -1,0 +1,638 @@
+---
+title: "Reviewer 3 doublet check: Plp1+ non-engram CA1 cells"
+subtitle: "GENOME/2025/281698 revision, supplemental sensitivity analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: kable
+params:
+  out_dir: "/atium/Data/projects/sheridansinglecell/r2r_doublet_check"
+  force: false
+  ncores: 24
+---
+
+<!--
+Reads Sheridan Cavalier's saved objects read-only and writes only to params$out_dir.
+It does not modify her Rmds, objects, or the upstream pipeline.
+Render on a host that mounts /atium (zoro or winry), e.g.
+  ~/miniforge3/envs/r2r_doublets/bin/Rscript -e 'rmarkdown::render("r2r_doublet_check.Rmd", output_dir="<out_dir>")'
+Expensive steps (DoubletFinder, DESeq2 refits) are cached in <out_dir>/cache; set params$force=TRUE to recompute.
+-->
+
+# Setup
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(DoubletFinder)
+  library(DESeq2); library(BiocParallel); library(Matrix)
+  library(dplyr); library(tidyr); library(readr); library(ggplot2); library(patchwork); library(ggrepel)
+})
+OUT <- params$out_dir
+for (d in c("cache", "source_data_figS", "tables")) dir.create(file.path(OUT, d), recursive = TRUE, showWarnings = FALSE)
+
+D <- "/atium/Data/projects/sheridansinglecell"
+F_SEURAT     <- file.path(D, "R2C2/Data/Seurat_objs/R2C2_combined_final.rds")   # combined ONT object (Fig 3/4, Table S5)
+F_CA1DDS     <- file.path(D, "R2C2/Data/CA1/genes_scaled_cond_nobatch.rds")     # CA1 gene DESeqDataSet behind Fig 3D / 4
+F_ENGRAM     <- file.path(D, "R2C2/Data/CA1/engram_list.rds")                   # Fig 4A engram cells
+# Sheridan's DoubletFinder outputs, for concordance only. The first two were copied unchanged from winry:/home/sherbear/.
+F_SHER_8     <- file.path(OUT, "inputs_copied/doublet_list_8perc.rds")
+F_SHER_NEWPK <- file.path(OUT, "inputs_copied/doublet_list_newpKs.rds")
+F_SHER_ATIUM <- file.path(D, "files_for_resub/doublet_removed_data/doublet_list.rds")
+
+# 16 mice; NC1 (Illumina-comparison mouse) is in the combined object but not in this dataset.
+SAMPLES <- c("FC1","UC1","FC2","UC2","NC2","FC3","UC3","NC3","FC4","UC4","NC4","FC5","UC5","NC5","FC6","UC6")
+cond_of <- function(s) unname(c(FC = "C+", UC = "U+", NC = "N")[substr(s, 1, 2)])
+
+## Thresholds and choices (all reported in the summary)
+RATES   <- c(r1.6 = 0.016, r8 = 0.08)  # expected multiplet rate per sample (10x: ~1.6% for ~2,000 cells recovered); 8% = 5x permissive
+DF_PN   <- 0.25                        # DoubletFinder pN (default; Sheridan's value)
+DF_PCS  <- 1:10                        # PCs for DoubletFinder (Sheridan's value)
+PLP1_MIN_PRIMARY <- 1                  # Plp1+ = at least 1 Plp1 UMI
+PLP1_MIN_ALT     <- 2                  # second threshold: at least 2 Plp1 UMIs
+OLIG_MARKERS   <- c("Plp1","Mbp","Mag","Mog","Mobp","Cldn11","Ermn","Opalin","Sox10","Olig1","Olig2")
+OLIG_NONMYELIN <- setdiff(OLIG_MARKERS, c("Plp1","Mbp"))  # markers a neuron-oligodendrocyte doublet should also carry
+NEURON_MARKERS <- c("Neurod6","Spink8","Wfs1","Slc17a7")
+GROUP_LEVELS <- c("Plp1+ non-engram","Plp1- non-engram","Engram","Olig_1","Olig_2","OPC")
+set.seed(2026)
+```
+
+# Load Sheridan's objects and check against the paper
+
+```{r load}
+seu <- readRDS(F_SEURAT)
+seu <- UpdateSeuratObject(seu)
+# Cluster renaming exactly as in plotting_for_revision.Rmd (DoubletFinder section)
+new.cluster.ids <- c('Dentate 1','Olig 1','Neuroblast','Astrocyte','Dentate 2','Microglia 1','CA1','Dentate 3','Endothelial','OPC','CA2','Olig 2','Progenitor','Pericyte 1','Inhibitory','Progenitor','CA3','CR','Pericyte 2','ua','Microglia 2','ua','Olig 3','Olig 4')
+names(new.cluster.ids) <- levels(seu)
+seu <- RenameIdents(seu, new.cluster.ids)
+seu$celltype <- as.character(Idents(seu))
+seu <- seu[, seu$orig.ident %in% SAMPLES]   # drop NC1
+cat("cells (16 mice):", ncol(seu), "\n")
+ct_n <- table(seu$celltype)
+print(ct_n[c("CA1","Olig 1","Olig 2","OPC")])   # Table S5: 843, 2155, 526, 668
+stopifnot(ct_n[["CA1"]] == 843)
+
+cnt <- GetAssayData(seu, assay = "RNA", layer = "counts")
+meta <- seu@meta.data %>% mutate(cell = colnames(seu), mouse = orig.ident, condition = cond_of(orig.ident))
+
+dds0 <- readRDS(F_CA1DDS)
+ca1_cells <- sub("^[^_]+_", "", colnames(dds0))          # "FC1_FC1_x" -> "FC1_x"
+stopifnot(ncol(dds0) == 843, setequal(ca1_cells, meta$cell[meta$celltype == "CA1"]))
+print(table(dds0$condition))                              # Supp Data 5: 408 C+, 333 U+, 102 N
+stopifnot(all(cnt[c("Plp1","Mbp","Fos"), ca1_cells] == counts(dds0)[c("Plp1","Mbp","Fos"), ]))
+cat("design of saved CA1 fit:", deparse(design(dds0)), "\n")
+
+engram_cells <- sub("^[^_]+_", "", readRDS(F_ENGRAM))
+stopifnot(all(engram_cells %in% ca1_cells))
+cat("engram cells:", length(engram_cells), "; C+ engram fraction:",
+    round(mean(ca1_cells[dds0$condition == "Conditioned"] %in% engram_cells), 3), "\n")
+
+# mouse -> batch / sex (one batch per mouse, from the CA1 object's colData)
+mouse_info <- data.frame(mouse = sub("_.*", "", ca1_cells), batch = as.character(dds0$batch), sex = as.character(dds0$sex)) %>%
+  distinct() %>% mutate(condition = cond_of(mouse))
+stopifnot(!any(duplicated(mouse_info$mouse)), nrow(mouse_info) == 16)
+write_csv(mouse_info, file.path(OUT, "tables", "mouse_batch_sex.csv"))
+mouse_info
+```
+
+# 1. Plp1+ CA1 cells
+
+```{r groups}
+ca1 <- meta[ca1_cells, ] %>%
+  mutate(engram = cell %in% engram_cells,
+         Plp1 = cnt["Plp1", cell], Mbp = cnt["Mbp", cell], Fos = cnt["Fos", cell],
+         group = case_when(engram ~ "Engram", Plp1 >= PLP1_MIN_PRIMARY ~ "Plp1+ non-engram", TRUE ~ "Plp1- non-engram"),
+         group_alt = case_when(engram ~ "Engram", Plp1 >= PLP1_MIN_ALT ~ "Plp1+ non-engram", TRUE ~ "Plp1- non-engram")) %>%
+  left_join(mouse_info %>% select(mouse, batch, sex), by = "mouse")
+rownames(ca1) <- ca1$cell
+grp_counts <- ca1 %>% count(condition, group) %>% pivot_wider(names_from = group, values_from = n)
+grp_counts_alt <- ca1 %>% count(condition, group_alt) %>% pivot_wider(names_from = group_alt, values_from = n)
+write_csv(grp_counts, file.path(OUT, "tables", "ca1_group_counts_primary.csv"))
+write_csv(grp_counts_alt, file.path(OUT, "tables", "ca1_group_counts_alt.csv"))
+grp_counts; grp_counts_alt
+cat("Plp1 UMIs in Plp1+ non-engram cells (primary):\n"); print(table(pmin(ca1$Plp1[ca1$group == "Plp1+ non-engram"], 5)))
+cat("Plp1+ fraction among engram cells (>=1 UMI):", round(mean(ca1$Plp1[ca1$engram] >= 1), 3),
+    "; among non-engram:", round(mean(ca1$Plp1[!ca1$engram] >= 1), 3), "\n")
+```
+
+# 2. Marker detection, expression and library size by group
+
+```{r markers}
+group_cells <- c(split(ca1$cell, ca1$group),
+                 list(Olig_1 = meta$cell[meta$celltype == "Olig 1"], Olig_2 = meta$cell[meta$celltype == "Olig 2"],
+                      OPC = meta$cell[meta$celltype == "OPC"]))
+group_cells_alt <- c(split(ca1$cell, ca1$group_alt), group_cells[c("Olig_1","Olig_2","OPC")])
+genes <- c(OLIG_MARKERS, NEURON_MARKERS)
+stopifnot(all(genes %in% rownames(cnt)))
+marker_stats <- function(gc, label) {
+  bind_rows(lapply(names(gc), function(g) {
+    cc <- gc[[g]]; m <- as.matrix(cnt[genes, cc, drop = FALSE]); lib <- meta[cc, "nCount_RNA"]
+    data.frame(threshold = label, group = g, n_cells = length(cc), gene = genes,
+               pct_detected = 100 * rowMeans(m > 0),
+               mean_umi = rowMeans(m),
+               mean_cp10k = rowMeans(sweep(m, 2, lib, "/")) * 1e4)
+  }))
+}
+ms <- bind_rows(marker_stats(group_cells, "Plp1>=1"), marker_stats(group_cells_alt, "Plp1>=2")) %>%
+  mutate(group = factor(group, levels = GROUP_LEVELS), gene = factor(gene, levels = genes))
+write_csv(ms, file.path(OUT, "tables", "marker_stats_by_group.csv"))
+
+lib_stats <- bind_rows(lapply(names(group_cells), function(g) {
+  cc <- group_cells[[g]]
+  data.frame(group = g, cell = cc, nCount_RNA = meta[cc, "nCount_RNA"], nFeature_RNA = meta[cc, "nFeature_RNA"])
+})) %>% mutate(group = factor(group, levels = GROUP_LEVELS))
+lib_summary <- lib_stats %>% group_by(group) %>%
+  summarise(n = n(), median_UMI = median(nCount_RNA), IQR_UMI = IQR(nCount_RNA),
+            median_genes = median(nFeature_RNA), IQR_genes = IQR(nFeature_RNA))
+# Wilcoxon: Plp1+ non-engram vs Plp1- non-engram CA1
+w_umi <- wilcox.test(nCount_RNA ~ group, data = droplevels(filter(lib_stats, group %in% c("Plp1+ non-engram","Plp1- non-engram"))))
+w_gen <- wilcox.test(nFeature_RNA ~ group, data = droplevels(filter(lib_stats, group %in% c("Plp1+ non-engram","Plp1- non-engram"))))
+lib_summary <- lib_summary %>% mutate(ratio_to_Plp1neg_UMI = median_UMI / median_UMI[group == "Plp1- non-engram"])
+write_csv(lib_summary, file.path(OUT, "tables", "library_size_by_group.csv"))
+lib_summary
+cat("Wilcoxon Plp1+ vs Plp1- non-engram: UMI p =", signif(w_umi$p.value, 3), "; genes p =", signif(w_gen$p.value, 3), "\n")
+# Expected library size of a CA1 + oligodendrocyte doublet ~ sum of medians
+cat("Expected doublet UMI (median Plp1- CA1 + median Olig_1):",
+    lib_summary$median_UMI[lib_summary$group == "Plp1- non-engram"] + lib_summary$median_UMI[lib_summary$group == "Olig_1"], "\n")
+
+# Cells carrying any oligodendrocyte marker other than Plp1/Mbp
+any_other <- ca1 %>% mutate(n_other = colSums(as.matrix(cnt[OLIG_NONMYELIN, cell]) > 0)) %>%
+  group_by(group) %>% summarise(n = n(), pct_any_other_olig_marker = 100 * mean(n_other > 0), mean_n_other = mean(n_other))
+write_csv(any_other, file.path(OUT, "tables", "ca1_any_other_olig_marker.csv"))
+any_other
+```
+
+## Observed vs expected oligodendrocyte-marker UMIs if Plp1 came from an attached oligodendrocyte
+
+If the Plp1 UMIs in Plp1+ non-engram CA1 droplets came from a captured oligodendrocyte (or OPC), the other markers
+should come with them at the ratio seen in real oligodendrocytes. Expected UMIs of marker m = (pooled Plp1 UMIs in the
+Plp1+ non-engram pool) x (pooled m / pooled Plp1 in the reference cluster). One-sided Poisson test for observed < expected.
+
+```{r expected}
+pool <- group_cells[["Plp1+ non-engram"]]
+P_obs <- sum(cnt["Plp1", pool])
+oe <- bind_rows(lapply(c("Olig_1","Olig_2","OPC"), function(ref) {
+  rc <- group_cells[[ref]]; ref_sum <- rowSums(cnt[OLIG_MARKERS, rc]); obs <- rowSums(cnt[OLIG_MARKERS, pool])
+  data.frame(reference = ref, gene = OLIG_MARKERS, observed = obs,
+             expected = P_obs * ref_sum / ref_sum[["Plp1"]]) %>%
+    rowwise() %>% mutate(p_less = if (gene == "Plp1") NA_real_ else poisson.test(observed, 1, expected, alternative = "less")$p.value) %>% ungroup()
+}))
+write_csv(oe, file.path(OUT, "tables", "observed_vs_expected_olig_umis.csv"))
+oe %>% filter(reference == "Olig_1")
+```
+
+# 3. DoubletFinder rerun (per sample, recorded pK sweep)
+
+Preprocessing per sample follows Sheridan's code: NormalizeData; FindVariableFeatures (mean.var.plot, mean.cutoff 0.0125-3,
+dispersion.cutoff 0.5-Inf); ScaleData regressing percent.mt (variable features only; PCA uses only these); PCA; FindNeighbors
+(1:30) and FindClusters (res 0.6) for the homotypic model. pK = argmax of the BCmvn metric from paramSweep/summarizeSweep/find.pK
+(pN 0.25, PCs 1:10). nExp = round(rate x cells in sample); homotypic-adjusted nExp = round(nExp x (1 - modelHomotypic(clusters))).
+Primary calls use the homotypic-adjusted nExp; unadjusted calls are also reported.
+
+```{r doubletfinder}
+f_df <- file.path(OUT, "cache", "doubletfinder_calls.rds")
+if (file.exists(f_df) && !params$force) {
+  dfr <- readRDS(f_df)
+} else {
+  calls <- list(); info <- list(); sweeps <- list()
+  for (s in SAMPLES) {
+    cc <- meta$cell[meta$mouse == s]
+    obj <- CreateSeuratObject(counts = cnt[, cc], meta.data = meta[cc, c("orig.ident","percent.mt")])
+    set.seed(2026)
+    obj <- NormalizeData(obj, verbose = FALSE)
+    obj <- FindVariableFeatures(obj, selection.method = "mean.var.plot", mean.cutoff = c(0.0125, 3), dispersion.cutoff = c(0.5, Inf), verbose = FALSE)
+    obj <- ScaleData(obj, features = VariableFeatures(obj), vars.to.regress = "percent.mt", verbose = FALSE)
+    obj <- RunPCA(obj, features = VariableFeatures(obj), npcs = 30, verbose = FALSE)
+    obj <- FindNeighbors(obj, dims = 1:30, verbose = FALSE)
+    obj <- FindClusters(obj, resolution = 0.6, verbose = FALSE)
+    sw <- paramSweep(obj, PCs = DF_PCS, sct = FALSE, num.cores = params$ncores)
+    bc <- find.pK(summarizeSweep(sw, GT = FALSE))
+    pK <- as.numeric(as.character(bc$pK[which.max(bc$BCmetric)]))
+    homo <- modelHomotypic(obj$seurat_clusters)
+    n <- ncol(obj); out <- data.frame(cell = colnames(obj), sample = s); pann <- NULL
+    for (rn in names(RATES)) {
+      nExp <- round(RATES[[rn]] * n); nAdj <- round(nExp * (1 - homo))
+      for (v in c("raw", "adj")) {
+        ne <- if (v == "raw") nExp else nAdj
+        set.seed(2026)
+        obj <- doubletFinder(obj, PCs = DF_PCS, pN = DF_PN, pK = pK, nExp = ne, reuse.pANN = pann, sct = FALSE)
+        if (is.null(pann)) { pann <- paste("pANN", DF_PN, pK, ne, sep = "_"); out$pANN <- obj@meta.data[[pann]] }
+        out[[paste(rn, v, sep = "_")]] <- obj@meta.data[[paste("DF.classifications", DF_PN, pK, ne, sep = "_")]] == "Doublet"
+        info[[length(info) + 1]] <- data.frame(sample = s, n_cells = n, pK = pK, homotypic_prop = homo, rate = RATES[[rn]],
+                                               version = v, nExp = ne, n_called = sum(out[[paste(rn, v, sep = "_")]]))
+      }
+    }
+    calls[[s]] <- out; sweeps[[s]] <- bc %>% mutate(sample = s)
+    message(s, ": n=", n, " pK=", pK)
+  }
+  dfr <- list(calls = bind_rows(calls), info = bind_rows(info), bcmvn = bind_rows(sweeps))
+  saveRDS(dfr, f_df)
+}
+df_calls <- dfr$calls; rownames(df_calls) <- df_calls$cell
+write_csv(dfr$info, file.path(OUT, "tables", "doubletfinder_per_sample_params.csv"))
+write_csv(dfr$bcmvn %>% mutate(pK = as.numeric(as.character(pK))), file.path(OUT, "tables", "doubletfinder_bcmvn_sweeps.csv"))
+write_csv(df_calls, file.path(OUT, "tables", "doubletfinder_calls_all_cells.csv"))
+dfr$info %>% filter(rate == 0.016, version == "adj") %>% select(sample, n_cells, pK, homotypic_prop, nExp)
+```
+
+## Concordance with Sheridan's lists
+
+```{r concordance}
+sher <- list(sheridan_8perc = readRDS(F_SHER_8), sheridan_newpKs = readRDS(F_SHER_NEWPK), sheridan_atium_list = readRDS(F_SHER_ATIUM))
+mine <- lapply(c(r1.6_raw = "r1.6_raw", r1.6_adj = "r1.6_adj", r8_raw = "r8_raw", r8_adj = "r8_adj"), function(k) df_calls$cell[df_calls[[k]]])
+conc <- expand.grid(set_mine = names(mine), set_sheridan = names(sher), stringsAsFactors = FALSE)
+conc$n_mine      <- sapply(conc$set_mine, function(k) length(mine[[k]]))
+conc$n_sheridan  <- sapply(conc$set_sheridan, function(k) length(sher[[k]]))
+conc$overlap     <- mapply(function(a, b) length(intersect(mine[[a]], sher[[b]])), conc$set_mine, conc$set_sheridan)
+conc$jaccard     <- mapply(function(a, b) length(intersect(mine[[a]], sher[[b]])) / length(union(mine[[a]], sher[[b]])), conc$set_mine, conc$set_sheridan)
+write_csv(conc, file.path(OUT, "tables", "doublet_list_concordance.csv"))
+conc
+```
+
+# 4. Are Plp1+ non-engram CA1 cells enriched for doublet flags?
+
+```{r df_enrichment}
+flag_sets <- c(mine, sher)
+enr <- bind_rows(lapply(names(flag_sets), function(k) {
+  fl <- ca1$cell %in% flag_sets[[k]]
+  bind_rows(lapply(c("group", "group_alt"), function(gcol) {
+    tgt <- ca1[[gcol]] == "Plp1+ non-engram"
+    ft <- fisher.test(table(factor(tgt, c(TRUE, FALSE)), factor(fl, c(TRUE, FALSE))))
+    data.frame(flag_set = k, plp1_threshold = ifelse(gcol == "group", "Plp1>=1", "Plp1>=2"),
+               n_plp1pos_NE = sum(tgt), flagged_plp1pos_NE = sum(fl & tgt), pct_plp1pos_NE = 100 * mean(fl[tgt]),
+               n_other_CA1 = sum(!tgt), flagged_other_CA1 = sum(fl & !tgt), pct_other_CA1 = 100 * mean(fl[!tgt]),
+               pct_plp1neg_NE = 100 * mean(fl[ca1[[gcol]] == "Plp1- non-engram"]), pct_engram = 100 * mean(fl[ca1$engram]),
+               pct_all_CA1 = 100 * mean(fl), pct_all_cells = 100 * mean(meta$cell %in% flag_sets[[k]]),
+               fisher_OR = unname(ft$estimate), fisher_p = ft$p.value)
+  }))
+}))
+write_csv(enr, file.path(OUT, "tables", "doublet_flag_enrichment_ca1.csv"))
+enr %>% filter(plp1_threshold == "Plp1>=1") %>% select(flag_set, pct_plp1pos_NE, pct_other_CA1, pct_all_CA1, pct_all_cells, fisher_OR, fisher_p)
+
+# Flag rate by cell type (primary calls) to put CA1 in context
+ct_rate <- meta %>% mutate(f16 = cell %in% mine[["r1.6_adj"]], f8 = cell %in% mine[["r8_adj"]]) %>%
+  group_by(celltype) %>% summarise(n = n(), pct_flag_1.6 = 100 * mean(f16), pct_flag_8 = 100 * mean(f8), median_UMI = median(nCount_RNA)) %>%
+  arrange(desc(pct_flag_8))
+write_csv(ct_rate, file.path(OUT, "tables", "doublet_flag_rate_by_celltype.csv"))
+ct_rate
+```
+
+# 5. Animal and batch
+
+```{r per_mouse}
+olig_frac <- meta %>% group_by(mouse) %>% summarise(n_cells = n(), pct_oligodendrocyte = 100 * mean(celltype %in% c("Olig 1","Olig 2","Olig 3","Olig 4")),
+                                                     pct_flag_1.6_all = 100 * mean(cell %in% mine[["r1.6_adj"]]),
+                                                     pct_flag_8_all = 100 * mean(cell %in% mine[["r8_adj"]]))
+pm <- ca1 %>% group_by(mouse, condition, batch, sex) %>%
+  summarise(n_CA1 = n(), n_engram = sum(engram),
+            n_plp1pos_NE = sum(group == "Plp1+ non-engram"), n_plp1pos_NE_alt = sum(group_alt == "Plp1+ non-engram"),
+            n_plp1pos_any = sum(Plp1 >= 1),
+            pct_plp1pos_NE = 100 * n_plp1pos_NE / n_CA1, pct_plp1pos_NE_alt = 100 * n_plp1pos_NE_alt / n_CA1,
+            pct_plp1pos_any = 100 * n_plp1pos_any / n_CA1,
+            plp1_cpm_pseudobulk = 1e6 * sum(Plp1) / sum(nCount_RNA), mbp_cpm_pseudobulk = 1e6 * sum(Mbp) / sum(nCount_RNA),
+            pct_CA1_flag_1.6 = 100 * mean(cell %in% mine[["r1.6_adj"]]), pct_CA1_flag_8 = 100 * mean(cell %in% mine[["r8_adj"]]),
+            .groups = "drop") %>%
+  left_join(olig_frac, by = "mouse") %>% arrange(condition, mouse)
+write_csv(pm, file.path(OUT, "tables", "per_mouse_ca1.csv"))
+pm
+
+isC <- pm$condition == "C+"
+tests <- bind_rows(lapply(c("pct_plp1pos_NE","pct_plp1pos_NE_alt","pct_plp1pos_any","plp1_cpm_pseudobulk","mbp_cpm_pseudobulk"), function(v) {
+  data.frame(metric = v, mean_Cplus = mean(pm[[v]][isC]), mean_UplusN = mean(pm[[v]][!isC]),
+             mean_Uplus = mean(pm[[v]][pm$condition == "U+"]), mean_N = mean(pm[[v]][pm$condition == "N"]),
+             n_Cplus_above_max_other = sum(pm[[v]][isC] > max(pm[[v]][!isC])),
+             n_Cplus_above_median_other = sum(pm[[v]][isC] > median(pm[[v]][!isC])),
+             wilcox_p = wilcox.test(pm[[v]][isC], pm[[v]][!isC], exact = TRUE)$p.value)
+}))
+# Mouse-level quasibinomial GLM on Plp1+ non-engram counts (overdispersion across mice), with and without batch
+pm$Cplus <- as.integer(isC)
+qb  <- glm(cbind(n_plp1pos_NE, n_CA1 - n_plp1pos_NE) ~ Cplus, family = quasibinomial, data = pm)
+qbb <- glm(cbind(n_plp1pos_NE, n_CA1 - n_plp1pos_NE) ~ Cplus + batch, family = quasibinomial, data = pm)
+glm_res <- data.frame(model = c("~ C+", "~ C+ + batch"),
+                      OR_Cplus = exp(c(coef(qb)[["Cplus"]], coef(qbb)[["Cplus"]])),
+                      p = c(summary(qb)$coefficients["Cplus", 4], summary(qbb)$coefficients["Cplus", 4]))
+write_csv(tests, file.path(OUT, "tables", "per_mouse_condition_tests.csv")); write_csv(glm_res, file.path(OUT, "tables", "per_mouse_glm.csv"))
+tests; glm_res
+
+# Leave-one-mouse-out and leave-one-batch-out: C+ / (U+ and N) ratio of mean per-mouse values
+loo1 <- function(p, label) { c <- p$condition == "C+"
+  data.frame(dropped = label, n_Cplus_mice = sum(c), n_other_mice = sum(!c),
+             ratio_pct_plp1pos_NE = mean(p$pct_plp1pos_NE[c]) / mean(p$pct_plp1pos_NE[!c]),
+             ratio_plp1_cpm = mean(p$plp1_cpm_pseudobulk[c]) / mean(p$plp1_cpm_pseudobulk[!c]),
+             ratio_mbp_cpm = mean(p$mbp_cpm_pseudobulk[c]) / mean(p$mbp_cpm_pseudobulk[!c])) }
+loo_res <- bind_rows(loo1(pm, "none"),
+                     bind_rows(lapply(pm$mouse, function(x) loo1(pm[pm$mouse != x, ], paste("mouse", x)))),
+                     bind_rows(lapply(sort(unique(pm$batch)), function(x) loo1(pm[pm$batch != x, ], paste("batch", x)))))
+write_csv(loo_res, file.path(OUT, "tables", "leave_one_out.csv"))
+loo_res
+cat("Spearman: per-mouse Plp1+ NE % vs % oligodendrocytes in sample:",
+    round(cor(pm$pct_plp1pos_NE, pm$pct_oligodendrocyte, method = "spearman"), 2),
+    "; vs sample doublet flag % (8%):", round(cor(pm$pct_plp1pos_NE, pm$pct_flag_8_all, method = "spearman"), 2), "\n")
+
+# Control: Plp1 detection in other neuronal clusters by condition
+ctrl <- meta %>% filter(celltype %in% c("CA1","CA2","CA3","Dentate 1","Dentate 2","Dentate 3","Inhibitory")) %>%
+  mutate(plp1pos = cnt["Plp1", cell] >= 1, mbppos = cnt["Mbp", cell] >= 1) %>%
+  group_by(celltype, condition) %>% summarise(n = n(), pct_plp1pos = 100 * mean(plp1pos), pct_mbppos = 100 * mean(mbppos), .groups = "drop") %>%
+  pivot_wider(names_from = condition, values_from = c(n, pct_plp1pos, pct_mbppos))
+write_csv(ctrl, file.path(OUT, "tables", "plp1_detection_other_neurons.csv"))
+ctrl
+```
+
+# 6. CA1 experience DE refit with and without doublets
+
+The saved CA1 object (`genes_scaled_cond_nobatch.rds`) was fit with design `~ scaled + condition`, LRT against `~ scaled`
+(`scaled` = nCount_RNA scaled without centering). Sheridan's before/after comparison subset this fitted object and called
+`results()` without refitting, so its q-values could not change. Here every set is refit with `DESeq()` using the same
+design, the saved size factors, and the parameters in her code (`fitType="local", useT=TRUE, minmu=1e-6,
+minReplicatesForReplace=Inf, test="LRT"`). The full refit is checked against the stored fit first.
+
+```{r deseq}
+refit <- function(keep) {
+  d <- dds0[, keep]
+  dd <- DESeqDataSetFromMatrix(counts(d), colData = data.frame(scaled = as.numeric(d$scaled), condition = droplevels(d$condition), row.names = colnames(d)),
+                               design = ~ scaled + condition)
+  sizeFactors(dd) <- sizeFactors(d)
+  DESeq(dd, fitType = "local", useT = TRUE, minmu = 1e-6, minReplicatesForReplace = Inf, test = "LRT", reduced = ~ scaled,
+        parallel = TRUE, BPPARAM = MulticoreParam(params$ncores), quiet = TRUE)
+}
+removal_sets <- list(none = character(0),
+                     mine_1.6_adj = mine[["r1.6_adj"]], mine_8_adj = mine[["r8_adj"]],
+                     mine_1.6_raw = mine[["r1.6_raw"]], mine_8_raw = mine[["r8_raw"]],
+                     sheridan_newpKs = sher[["sheridan_newpKs"]], sheridan_8perc = sher[["sheridan_8perc"]])
+f_de <- file.path(OUT, "cache", "deseq_refits.rds")
+if (file.exists(f_de) && !params$force) fits <- readRDS(f_de) else {
+  fits <- lapply(removal_sets, function(rm) refit(!(ca1_cells %in% rm)))
+  saveRDS(fits, f_de)
+}
+
+summarise_fit <- function(fit) {
+  r <- results(fit)
+  cu <- results(fit, contrast = c("condition", "Conditioned", "Unconditioned")); cn <- results(fit, contrast = c("condition", "Conditioned", "Naive"))
+  cond_up <- union(rownames(cu)[which(cu$padj < .05 & cu$log2FoldChange > .25)], rownames(cn)[which(cn$padj < .05 & cn$log2FoldChange > .25)])
+  nc <- counts(fit, normalized = TRUE); isC <- fit$condition == "Conditioned"
+  fc3d <- log2(rowMeans(nc[, isC]) / rowMeans(nc[, !isC]))          # Fig 3D x-axis (C+ vs mean of U+/N)
+  fig3d_up <- rownames(r)[which(r$padj < .05 & fc3d > .25)]
+  list(sig = rownames(r)[which(r$padj < .05)], cond_up = cond_up, fig3d_up = fig3d_up, r = r, fc3d = fc3d, cu = cu, cn = cn)
+}
+S <- lapply(fits, summarise_fit)
+S_stored <- summarise_fit(dds0)   # Sheridan's stored fit, for the reproduction check
+repro <- data.frame(stored_n_sig = length(S_stored$sig), refit_n_sig = length(S$none$sig),
+                    overlap = length(intersect(S_stored$sig, S$none$sig)),
+                    spearman_LRTp = cor(mcols(dds0)$LRTPvalue, S$none$r$pvalue, method = "spearman", use = "complete.obs"),
+                    stored_plp1_padj = S_stored$r["Plp1", "padj"], refit_plp1_padj = S$none$r["Plp1", "padj"],
+                    stored_plp1_fig3d_log2FC = unname(S_stored$fc3d["Plp1"]), refit_plp1_fig3d_log2FC = unname(S$none$fc3d["Plp1"]),
+                    stored_n_cond_up = length(S_stored$cond_up), refit_n_cond_up = length(S$none$cond_up),
+                    stored_n_fig3d_up = length(S_stored$fig3d_up), refit_n_fig3d_up = length(S$none$fig3d_up))
+write_csv(repro, file.path(OUT, "tables", "deseq_reproduction_check.csv")); repro
+
+de_row <- function(k, s, b, ncells, nC) {
+  data.frame(removal = k, n_cells = ncells, n_removed = 843 - ncells,
+             n_removed_Cplus = 408 - nC,
+             n_sig_LRT = length(s$sig), overlap_sig_with_full = length(intersect(s$sig, b$sig)),
+             pct_full_sig_retained = 100 * length(intersect(s$sig, b$sig)) / length(b$sig),
+             n_Cplus_up = length(s$cond_up), overlap_Cplus_up_with_full = length(intersect(s$cond_up, b$cond_up)),
+             n_fig3d_up = length(s$fig3d_up), overlap_fig3d_up_with_full = length(intersect(s$fig3d_up, b$fig3d_up)),
+             plp1_fig3d_log2FC = unname(s$fc3d["Plp1"]), plp1_LRT_padj = s$r["Plp1", "padj"],
+             plp1_lfc_C_vs_U = s$cu["Plp1", "log2FoldChange"], plp1_lfc_C_vs_N = s$cn["Plp1", "log2FoldChange"],
+             plp1_in_fig3d_up = "Plp1" %in% s$fig3d_up)
+}
+de_tab <- bind_rows(lapply(names(S), function(k) {
+  s <- S[[k]]; b <- S$none
+  data.frame(removal = k, n_cells = ncol(fits[[k]]), n_removed = 843 - ncol(fits[[k]]),
+             n_removed_Cplus = sum(fits$none$condition == "Conditioned") - sum(fits[[k]]$condition == "Conditioned"),
+             n_sig_LRT = length(s$sig), overlap_sig_with_full = length(intersect(s$sig, b$sig)),
+             pct_full_sig_retained = 100 * length(intersect(s$sig, b$sig)) / length(b$sig),
+             n_Cplus_up = length(s$cond_up), overlap_Cplus_up_with_full = length(intersect(s$cond_up, b$cond_up)),
+             n_fig3d_up = length(s$fig3d_up), overlap_fig3d_up_with_full = length(intersect(s$fig3d_up, b$fig3d_up)),
+             plp1_fig3d_log2FC = unname(s$fc3d["Plp1"]), plp1_LRT_padj = s$r["Plp1", "padj"],
+             plp1_lfc_C_vs_U = s$cu["Plp1", "log2FoldChange"], plp1_lfc_C_vs_N = s$cn["Plp1", "log2FoldChange"],
+             plp1_rank_fig3d_log2FC_among_sig = match("Plp1", s$sig[order(-s$fc3d[s$sig])]))
+}))
+write_csv(de_tab, file.path(OUT, "tables", "deseq_before_after_doublet_removal.csv"))
+de_tab
+```
+
+# 7. Which cells and mice carry the C+ Plp1 signal?
+
+Removing only 2-3 cells at the 1.6% rate moved the Plp1 log2FC, so we look at the highest-Plp1 droplets directly and refit
+the CA1 model leaving out each mouse, and leaving out the top 1, 3, 5 and 10 CA1 cells ranked by Plp1 UMIs (any condition).
+
+```{r plp1_drivers}
+top_tab <- ca1 %>% arrange(desc(Plp1)) %>% head(15) %>%
+  mutate(sizeFactor = sizeFactors(dds0)[match(cell, ca1_cells)],
+         Mag = cnt["Mag", cell], Mog = cnt["Mog", cell], Mobp = cnt["Mobp", cell], Cldn11 = cnt["Cldn11", cell],
+         other_olig_umis = colSums(as.matrix(cnt[OLIG_NONMYELIN, cell])),
+         df_1.6 = cell %in% mine[["r1.6_adj"]], df_8 = cell %in% mine[["r8_adj"]], sheridan_8 = cell %in% sher[["sheridan_8perc"]]) %>%
+  select(cell, mouse, condition, batch, group, nCount_RNA, nFeature_RNA, sizeFactor, Plp1, Mbp, Mag, Mog, Mobp, Cldn11, other_olig_umis, Fos, df_1.6, df_8, sheridan_8)
+write_csv(top_tab, file.path(OUT, "tables", "top15_plp1_ca1_cells.csv")); top_tab
+
+share <- ca1 %>% group_by(condC = condition == "C+") %>% arrange(desc(Plp1), .by_group = TRUE) %>%
+  summarise(n_cells = n(), total_plp1_umis = sum(Plp1),
+            pct_from_top1 = 100 * sum(head(Plp1, 1)) / sum(Plp1), pct_from_top3 = 100 * sum(head(Plp1, 3)) / sum(Plp1),
+            pct_from_top10 = 100 * sum(head(Plp1, 10)) / sum(Plp1), cells_with_plp1 = sum(Plp1 > 0))
+write_csv(share, file.path(OUT, "tables", "plp1_umi_share_top_cells.csv")); share
+
+top_cells <- ca1 %>% arrange(desc(Plp1)) %>% pull(cell)
+loo_sets <- c(setNames(lapply(SAMPLES, function(m) ca1$cell[ca1$mouse == m]), paste0("drop_mouse_", SAMPLES)),
+              setNames(lapply(c(1, 3, 5, 10), function(k) top_cells[1:k]), paste0("drop_top", c(1, 3, 5, 10), "_plp1_cells")))
+f_lo <- file.path(OUT, "cache", "deseq_refits_loo.rds")
+if (file.exists(f_lo) && !params$force) S_lo <- readRDS(f_lo) else {
+  S_lo <- lapply(loo_sets, function(rm) { f <- refit(!(ca1_cells %in% rm)); s <- summarise_fit(f); s$ncol <- ncol(f); s$nC <- sum(f$condition == "Conditioned"); s$fit_condition <- f$condition; s })
+  saveRDS(S_lo, f_lo)
+}
+lo_tab <- bind_rows(lapply(names(S_lo), function(k) {
+  s <- S_lo[[k]]; de_row(k, s, S$none, s$ncol, s$nC)
+}))
+write_csv(lo_tab, file.path(OUT, "tables", "deseq_leave_one_out_plp1.csv"))
+lo_tab %>% select(removal, n_removed, n_sig_LRT, overlap_sig_with_full, plp1_fig3d_log2FC, plp1_LRT_padj, plp1_in_fig3d_up)
+```
+
+# 8. Fig 4C (engram vs non-engram) and Fig 4E (Fos-Plp1 correlation) without the top Plp1 droplets
+
+Fig 4C model as in Figure_4_plotting.Rmd: `~ sex + batch + engram`, LRT against `~ sex + batch`, same DESeq parameters.
+Fig 4E: Spearman correlation of size-factor-normalized counts across CA1 cells.
+
+```{r fig4_sensitivity}
+fit_engram <- function(drop) {
+  d <- dds0[, !(ca1_cells %in% drop)]
+  d$engram <- factor(ifelse(colnames(d) %in% readRDS(F_ENGRAM), "yes", "no"), levels = c("no", "yes"))
+  mcols(d) <- NULL   # drop the stored condition-model results before refitting
+  d <- DESeqDataSet(d, design = ~ sex + batch + engram)
+  DESeq(d, fitType = "local", useT = TRUE, minmu = 1e-6, minReplicatesForReplace = Inf, test = "LRT", reduced = ~ sex + batch,
+        parallel = TRUE, BPPARAM = MulticoreParam(params$ncores), quiet = TRUE)
+}
+f_en <- file.path(OUT, "cache", "deseq_engram_refits_v2.rds")
+drop_sets4 <- list(none = character(0), drop_top1 = top_cells[1], drop_top3 = top_cells[1:3])
+if (file.exists(f_en) && !params$force) en <- readRDS(f_en) else {
+  en <- lapply(drop_sets4, function(x) { f <- fit_engram(x); r <- results(f, contrast = c("engram", "yes", "no"))
+    r_nc <- results(f, contrast = c("engram", "yes", "no"), cooksCutoff = FALSE)
+    nc <- counts(f, normalized = TRUE)
+    list(plp1 = r["Plp1", ], plp1_nocooks = r_nc["Plp1", ], plp1_maxCooks = mcols(f)["Plp1", "maxCooks"],
+         cooks_cutoff = qf(0.99, length(resultsNames(f)), ncol(f) - length(resultsNames(f))),
+         n_sig = sum(r$padj < .05, na.rm = TRUE), sig = rownames(r)[which(r$padj < .05)],
+         rho = cor.test(nc["Fos", ], nc["Plp1", ], method = "spearman", exact = FALSE)) })
+  saveRDS(en, f_en)
+}
+# Cook's filtering (DESeq2 default) can set a gene's p-value to NA when one cell is an extreme outlier; Fig 4C's volcano drops NA-q genes.
+fig4 <- bind_rows(lapply(names(en), function(k) data.frame(removal = k, n_sig_engram_LRT = en[[k]]$n_sig,
+  overlap_with_full = length(intersect(en[[k]]$sig, en$none$sig)),
+  plp1_log2FC_engram_vs_non = en[[k]]$plp1$log2FoldChange, plp1_padj = en[[k]]$plp1$padj,
+  plp1_padj_cooksCutoff_off = en[[k]]$plp1_nocooks$padj, plp1_maxCooks = en[[k]]$plp1_maxCooks, cooks_cutoff = en[[k]]$cooks_cutoff,
+  spearman_Fos_Plp1 = unname(en[[k]]$rho$estimate), spearman_p = en[[k]]$rho$p.value)))
+write_csv(fig4, file.path(OUT, "tables", "fig4C_4E_sensitivity.csv")); fig4
+```
+
+# Supplemental figure
+
+```{r figure, fig.width = 12, fig.height = 22}
+theme_set(theme_classic(base_size = 13) + theme(plot.title = element_text(face = "bold", size = 14), plot.subtitle = element_text(size = 12),
+                                                plot.tag = element_text(face = "bold", size = 18),
+                                                axis.text = element_text(color = "black", size = 12), legend.text = element_text(size = 12),
+                                                legend.title = element_text(size = 12), strip.text = element_text(size = 13), strip.background = element_blank()))
+grp_cols <- c("Plp1+ non-engram" = "#d95f02", "Plp1- non-engram" = "#7f7f7f", "Engram" = "#e7298a", "Olig_1" = "#aba334", "Olig_2" = "#7a7425", "OPC" = "#499dd6")
+
+# A: tSNE with DoubletFinder calls
+ts <- as.data.frame(Embeddings(seu, "tsne")); colnames(ts) <- c("tSNE_1", "tSNE_2"); ts$cell <- rownames(ts)
+ts <- ts %>% mutate(call = case_when(cell %in% mine[["r1.6_adj"]] ~ "Doublet at 1.6%", cell %in% mine[["r8_adj"]] ~ "Doublet at 8% only", TRUE ~ "Singlet"),
+                    celltype = meta[cell, "celltype"]) %>% arrange(factor(call, levels = c("Singlet", "Doublet at 8% only", "Doublet at 1.6%")))
+lab <- ts %>% filter(celltype %in% c("CA1", "Olig 1", "Olig 2", "OPC")) %>% group_by(celltype) %>% summarise(tSNE_1 = median(tSNE_1), tSNE_2 = median(tSNE_2))
+pA <- ggplot(ts, aes(tSNE_1, tSNE_2, color = call)) + geom_point(size = 0.15) +
+  scale_color_manual(values = c("Singlet" = "grey85", "Doublet at 8% only" = "#fdae61", "Doublet at 1.6%" = "#d7191c"), name = NULL) +
+  geom_label_repel(data = lab, aes(label = celltype), color = "black", size = 4.2, label.size = 0.2, seed = 1, min.segment.length = 0) +
+  guides(color = guide_legend(override.aes = list(size = 4), ncol = 1)) + labs(title = "DoubletFinder calls, 16 samples", x = "tSNE 1", y = "tSNE 2") +
+  theme(legend.position = "right", axis.text = element_blank(), axis.ticks = element_blank())
+write_csv(ts %>% select(cell, tSNE_1, tSNE_2, celltype, call), file.path(OUT, "source_data_figS", "panelA_tsne_doubletfinder.csv"))
+
+# B: marker dot plot (primary threshold), full width
+msB <- ms %>% filter(threshold == "Plp1>=1") %>% mutate(group = factor(group, levels = rev(GROUP_LEVELS)))
+pB <- ggplot(msB, aes(gene, group)) + geom_point(aes(size = pct_detected, color = log10(mean_cp10k + 0.01))) +
+  scale_size_area(max_size = 9, breaks = c(1, 10, 50, 100), name = "% cells detected") +
+  scale_color_viridis_c(name = "log10 mean UMI per 10k", option = "C") +
+  geom_vline(xintercept = length(OLIG_MARKERS) + 0.5, linetype = "dashed") +
+  labs(x = NULL, y = NULL, title = "Oligodendrocyte markers (left of dashed line) and CA1 markers") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"), legend.position = "right", legend.box = "horizontal")
+write_csv(msB, file.path(OUT, "source_data_figS", "panelC_marker_dotplot.csv"))
+
+# C: UMIs and genes per cell (horizontal)
+libl <- lib_stats %>% pivot_longer(c(nCount_RNA, nFeature_RNA), names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric, nCount_RNA = "UMIs per cell", nFeature_RNA = "Genes per cell"), group = factor(group, levels = rev(GROUP_LEVELS)))
+pC <- ggplot(libl, aes(value, group, fill = group)) + geom_boxplot(outlier.size = 0.3, width = 0.7) + scale_x_log10() +
+  facet_wrap(~metric, scales = "free_x") + scale_fill_manual(values = grp_cols, guide = "none") +
+  labs(x = NULL, y = NULL, title = "Library size by group")
+write_csv(lib_stats, file.path(OUT, "source_data_figS", "panelD_library_size.csv"))
+
+# D: observed vs expected oligodendrocyte-marker UMIs
+oeD <- oe %>% filter(reference == "Olig_1", gene != "Plp1") %>% select(gene, observed, expected) %>%
+  pivot_longer(c(observed, expected), names_to = "what", values_to = "umis") %>%
+  mutate(gene = factor(gene, levels = OLIG_MARKERS[-1]), what = factor(what, levels = c("expected", "observed"),
+                                                                       labels = c("Expected from Olig_1 ratio", "Observed")))
+pD <- ggplot(oeD, aes(gene, umis + 0.5, fill = what)) + geom_col(position = position_dodge(0.8), width = 0.75) + scale_y_log10() +
+  scale_fill_manual(values = c("#aba334", "#d95f02"), name = NULL) +
+  labs(x = NULL, y = "Pooled UMIs (+0.5)", title = "Plp1+ non-engram CA1 pool",
+       subtitle = sprintf("%d pooled Plp1 UMIs", P_obs)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"), legend.position = c(0.72, 0.9))
+write_csv(oe, file.path(OUT, "source_data_figS", "panelE_observed_vs_expected.csv"))
+
+# E: DoubletFinder flag rate in CA1 groups; Fisher result in facet label
+plab <- enr %>% filter(plp1_threshold == "Plp1>=1", flag_set %in% c("r1.6_adj", "r8_adj")) %>%
+  mutate(rate = ifelse(flag_set == "r1.6_adj", "1.6%", "8%"), facet = sprintf("%s (p = %.2f)", rate, fisher_p))
+eE <- bind_rows(lapply(c("r1.6_adj", "r8_adj"), function(k) ca1 %>% mutate(flag = cell %in% mine[[k]]) %>% group_by(group) %>%
+                         summarise(n = n(), flagged = sum(flag), pct = 100 * mean(flag)) %>% mutate(rate = ifelse(k == "r1.6_adj", "1.6%", "8%")))) %>%
+  mutate(group = factor(group, levels = GROUP_LEVELS[1:3], labels = c("Plp1+ NE", "Plp1- NE", "Engram"))) %>% left_join(plab %>% select(rate, facet), by = "rate")
+allrate <- data.frame(rate = c("1.6%", "8%"), pct = c(100 * mean(meta$cell %in% mine[["r1.6_adj"]]), 100 * mean(meta$cell %in% mine[["r8_adj"]]))) %>%
+  left_join(plab %>% select(rate, facet), by = "rate")
+pE <- ggplot(eE, aes(group, pct, fill = group)) + geom_col(width = 0.7) + geom_text(aes(label = sprintf("%d/%d", flagged, n)), vjust = -0.3, size = 3.6) +
+  geom_hline(data = allrate, aes(yintercept = pct), linetype = "dashed") + facet_wrap(~facet, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = setNames(unname(grp_cols[1:3]), c("Plp1+ NE", "Plp1- NE", "Engram")), guide = "none") +
+  labs(x = NULL, y = "% CA1 cells flagged", title = "Doublet flags in CA1", subtitle = "Fisher p: Plp1+ NE vs rest of CA1\nDashed line: all cells") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+write_csv(eE, file.path(OUT, "source_data_figS", "panelB_doublet_flag_rate.csv"))
+
+# F: per-mouse Plp1+ non-engram fraction; G: per-mouse pseudobulk Plp1/Mbp
+pmF <- pm %>% mutate(condition = factor(condition, levels = c("C+", "U+", "N")))
+pF <- ggplot(pmF, aes(condition, pct_plp1pos_NE)) + geom_boxplot(outlier.shape = NA, width = 0.55, color = "grey40") +
+  geom_point(aes(color = batch, size = n_CA1), position = position_jitter(width = 0.12, seed = 1)) +
+  geom_text_repel(aes(label = mouse), size = 3.5, seed = 1, max.overlaps = 30) + scale_size_area(max_size = 6, name = "CA1 cells") +
+  labs(x = NULL, y = "% of the mouse's CA1 cells", title = "Plp1+ non-engram CA1 cells per mouse") +
+  scale_color_brewer(palette = "Dark2", name = "Batch") + theme(legend.position = "bottom", legend.box = "vertical")
+pmG <- pmF %>% select(mouse, condition, batch, n_CA1, Plp1 = plp1_cpm_pseudobulk, Mbp = mbp_cpm_pseudobulk) %>% pivot_longer(c(Plp1, Mbp), names_to = "gene", values_to = "cpm") %>%
+  mutate(gene = factor(gene, levels = c("Plp1", "Mbp")))
+pG <- ggplot(pmG, aes(condition, cpm)) + geom_boxplot(outlier.shape = NA, width = 0.55, color = "grey40") +
+  geom_point(aes(color = batch), size = 3, position = position_jitter(width = 0.12, seed = 1)) + facet_wrap(~gene, scales = "free_y") +
+  geom_text_repel(data = ~ filter(.x, cpm == max(cpm[gene == "Plp1"]) & gene == "Plp1"), aes(label = mouse), size = 3.5, nudge_x = 0.4) +
+  labs(x = NULL, y = "Pseudobulk CPM in CA1", title = "Per-mouse CA1 pseudobulk") + scale_color_brewer(palette = "Dark2", name = "Batch") +
+  theme(strip.text = element_text(face = "italic", size = 13), legend.position = "bottom")
+write_csv(pm, file.path(OUT, "source_data_figS", "panelFG_per_mouse.csv"))
+
+# H: Plp1 C+ vs U+/N log2FC (Fig 3D definition) and LRT q across refits
+lab_map <- c(none = "All 843 CA1 cells", mine_1.6_adj = "Remove DoubletFinder calls, 1.6%", mine_8_adj = "Remove DoubletFinder calls, 8%",
+             sheridan_newpKs = "Remove Sheridan 1.6% list", sheridan_8perc = "Remove Sheridan 8% list")
+lomo <- lo_tab %>% filter(grepl("drop_mouse", removal)) %>% mutate(mouse = sub("drop_mouse_", "", removal))
+hH <- bind_rows(de_tab %>% filter(removal %in% names(lab_map)) %>% mutate(label = unname(lab_map[removal]), set = "Doublet removal"),
+                lomo %>% filter(mouse %in% c("FC6", "FC1")) %>% mutate(label = paste("Leave out mouse", mouse), set = "Leave one mouse out"),
+                lo_tab %>% filter(grepl("drop_top", removal)) %>%
+                  mutate(label = paste("Remove top", sub("drop_top([0-9]+)_.*", "\\1", removal), "Plp1 droplet(s)"), set = "Remove top Plp1 droplets")) %>%
+  mutate(sig = ifelse(plp1_LRT_padj < 0.05, "q < 0.05", "q >= 0.05"))
+other <- lomo %>% filter(!mouse %in% c("FC6", "FC1"))
+rng <- data.frame(label = "Leave out any other mouse (14 fits)", set = "Leave one mouse out", xmin = min(other$plp1_fig3d_log2FC), xmax = max(other$plp1_fig3d_log2FC),
+                  qmax = max(other$plp1_LRT_padj))
+lv <- unname(c(hH$label[hH$set == "Doublet removal"], hH$label[hH$set == "Leave one mouse out"], rng$label, hH$label[hH$set == "Remove top Plp1 droplets"]))
+hH$label <- factor(hH$label, levels = rev(lv)); rng$label <- factor(rng$label, levels = rev(lv))
+pH <- ggplot(hH, aes(plp1_fig3d_log2FC, label)) + geom_vline(xintercept = 0, color = "grey50") + geom_vline(xintercept = 0.25, linetype = "dashed", color = "grey50") +
+  geom_segment(data = rng, aes(x = xmin, xend = xmax, y = label, yend = label, color = set), linewidth = 2.5, inherit.aes = FALSE) +
+  geom_text(data = rng, aes(x = xmax, y = label, label = sprintf("all q <= %.2g", qmax)), hjust = -0.15, size = 3.8, inherit.aes = FALSE) +
+  geom_point(aes(shape = sig, color = set), size = 3.5, stroke = 1.2) + scale_shape_manual(values = c("q < 0.05" = 16, "q >= 0.05" = 1), name = NULL) +
+  geom_text(aes(label = sprintf("q = %.2g", plp1_LRT_padj)), hjust = -0.3, size = 3.8) +
+  scale_color_manual(values = c("Doublet removal" = "#1b9e77", "Leave one mouse out" = "#7570b3", "Remove top Plp1 droplets" = "#d95f02"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = expression(italic(Plp1) ~ log[2] * "FC, C+ vs U+/N (Fig 3D)"), y = NULL, title = "CA1 Plp1 after refitting DESeq2 without selected cells",
+       subtitle = "Dashed line: 0.25 log2FC cutoff used for Fig 3D") +
+  theme(legend.position = "bottom")
+write_csv(bind_rows(hH, lomo %>% mutate(label = paste("Leave out mouse", mouse), set = "Leave one mouse out (all 16)")), file.path(OUT, "source_data_figS", "panelH_plp1_refits.csv"))
+
+# Assemble rows independently so axis alignment in one row does not squeeze another; tags set by hand in reading order
+tg <- function(pl, t) pl + labs(tag = t)
+row1 <- wrap_elements(full = tg(pA, "A") + tg(pE, "B") + plot_layout(widths = c(1, 1.15)))
+row2 <- wrap_elements(full = tg(pB, "C"))
+row3 <- wrap_elements(full = tg(pC, "D") + tg(pD, "E") + plot_layout(widths = c(1.15, 1)))
+row4 <- wrap_elements(full = tg(pF, "F") + tg(pG, "G") + plot_layout(widths = c(1, 1)))
+row5 <- wrap_elements(full = tg(pH + scale_y_discrete(limits = rev(lv)), "H"))
+fig <- row1 / row2 / row3 / row4 / row5 + plot_layout(heights = c(1, 0.8, 1, 1.15, 1.05))
+ggsave(file.path(OUT, "FigS_doublet_check.pdf"), fig, width = 13, height = 22, device = cairo_pdf)
+ggsave(file.path(OUT, "FigS_doublet_check.png"), fig, width = 13, height = 22, dpi = 200)
+fig
+```
+
+# Key numbers
+
+```{r key_numbers}
+e1 <- enr %>% filter(plp1_threshold == "Plp1>=1")
+kn <- tibble::tribble(~key, ~value,
+  "n_cells_16_mice", ncol(seu), "n_CA1", nrow(ca1),
+  "n_plp1pos_NE_primary", sum(ca1$group == "Plp1+ non-engram"), "n_plp1pos_NE_alt", sum(ca1$group_alt == "Plp1+ non-engram"),
+  "n_engram", sum(ca1$engram), "n_plp1neg_NE", sum(ca1$group == "Plp1- non-engram"),
+  "df_pct_all_1.6adj", 100 * mean(meta$cell %in% mine[["r1.6_adj"]]), "df_pct_all_8adj", 100 * mean(meta$cell %in% mine[["r8_adj"]]),
+  "df_pct_plp1posNE_1.6adj", e1$pct_plp1pos_NE[e1$flag_set == "r1.6_adj"], "df_pct_otherCA1_1.6adj", e1$pct_other_CA1[e1$flag_set == "r1.6_adj"],
+  "df_p_1.6adj", e1$fisher_p[e1$flag_set == "r1.6_adj"],
+  "df_pct_plp1posNE_8adj", e1$pct_plp1pos_NE[e1$flag_set == "r8_adj"], "df_pct_otherCA1_8adj", e1$pct_other_CA1[e1$flag_set == "r8_adj"],
+  "df_p_8adj", e1$fisher_p[e1$flag_set == "r8_adj"],
+  "median_UMI_plp1posNE", lib_summary$median_UMI[lib_summary$group == "Plp1+ non-engram"],
+  "median_UMI_plp1negNE", lib_summary$median_UMI[lib_summary$group == "Plp1- non-engram"],
+  "median_UMI_engram", lib_summary$median_UMI[lib_summary$group == "Engram"],
+  "median_UMI_olig1", lib_summary$median_UMI[lib_summary$group == "Olig_1"],
+  "wilcox_p_UMI_plp1pos_vs_neg", w_umi$p.value, "wilcox_p_genes_plp1pos_vs_neg", w_gen$p.value,
+  "pooled_plp1_umis_plp1posNE", P_obs)
+kn$value <- as.character(signif(as.numeric(kn$value), 4))
+write_tsv(kn, file.path(OUT, "tables", "key_numbers.tsv")); kn
+```
+
+# Session info
+
+```{r session}
+writeLines(capture.output(sessionInfo()), file.path(OUT, "sessionInfo.txt"))
+cat("DoubletFinder GitHub commit:", packageDescription("DoubletFinder")$RemoteSha, "\n")
+sessionInfo()
+```
