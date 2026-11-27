@@ -22,7 +22,7 @@ table3b):
 Syngap1-204 is not experience-variable under any model. The literal Methods model has no real depth normalization:
 each isoform object carries a dummy all-1 transcript, so its size factors are 1. Gene size factors come from the 1-3
 genes detected in every cell. That is why isoform calls inflate to 4,869. If we add sex and batch, keep `scaled`. All
-designs are full rank (each mouse is one batch), and the baseline level does not change the labels.
+designs are full rank (each mouse is one batch), and switching the baseline from C+ to N changes no label except one low-count gene (Foxg1) in one of eight checks.
 
 **Time models (R2 #3, Fig S9).** These have the same problem. The five-level isoform list is identical to Supp Data 6.
 The within-experience lists match the experience lists (median Jaccard 0.91-0.99). Clean refits share almost nothing

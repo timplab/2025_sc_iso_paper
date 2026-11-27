@@ -80,8 +80,8 @@ calls 20.8% of C+ (85/408), 17.4% of U+ (58/333) and 6.9% of N (7/102) CA1 cells
 **Methods sentence:** We defined engram cells from log-normalized Fos expression in CA1 (Seurat LogNormalize, scale
 factor equal to the mean CA1 UMI count, 4,949). We set the threshold at (mean + SD)/2 across all 843 CA1 cells (0.254,
 which is 0.29 SD above the mean). We chose it because it called about 21% of C+ CA1 cells (85 of 408), close to the
-roughly 25% expected from prior work (Chawla et al. 2013, PMID 23158763 [confirm this is the Chawla 2013 cited in
-Results]). The smallest nonzero Fos value was 0.437, so this threshold selects exactly the 150 CA1 cells with at least
+roughly 25% expected from prior work (Chawla et al. 2013, Neurobiol Aging 34:1184-1198, PMID 23158763 [confirm this is the
+Chawla 2013 cited in Results]). The smallest nonzero Fos value was 0.437, so this threshold selects exactly the 150 CA1 cells with at least
 one Fos UMI. A threshold of mean + 0.5 SD (0.330) selects the same cells.
 
 ---

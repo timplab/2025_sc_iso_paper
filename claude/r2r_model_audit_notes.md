@@ -18,7 +18,7 @@ Branch `r2r-model-audit` (from `r2r-doublets`). Code: `r2r_model_audit/`. Output
 - condition_time_for_supp.Rmd also has copy-paste bugs: Microglia and Olig gene blocks lack `results()` (their rows in
   cond_time_sig_genes.tsv are copies of Inhibitory and Neuroblast); the Progenitor gene block uses `~ sex + batch + condition`.
 - DESeq2 1.44.0 NEWS: LRT Cook's distances now use the full-model mean. This changes Cook's filtering for designs with replicated
-  model-matrix rows (sex + batch + engram) but not for `~ scaled + ...` designs, where maxCooks is NA for most features.
+  model-matrix rows (sex + batch + engram) but not for the saved `~ scaled + condition` fits: in CA2 and CA3 every maxCooks is far below the cutoff, and in CA1 maxCooks is NA.
 - Independent filtering differs between versions. DESeq2 1.39.7 NEWS: when no filter threshold reaches the target, IF now falls
   back to the threshold giving 90%/80% of the maximum rejections; 1.38.3 falls back to no filtering. This explains engram
   `~ sex + batch + engram` genes 36 (1.38.3, = plain BH) vs 130 (1.46.0) and CA2 genes 72 vs 264 on the saved model.
