@@ -1,0 +1,585 @@
+---
+title: "R2R model audit: DESeq2 models behind the experience, engram and time results"
+subtitle: "GENOME/2025/281698, Cavalier et al. Read-only audit of Sheridan Cavalier's saved objects"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  out: "/atium/Data/projects/sheridansinglecell/r2r_model_audit"
+  code: "/atium/Data/projects/sheridansinglecell/r2r_model_audit/code"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "")
+options(width = 160)
+suppressPackageStartupMessages({ library(dplyr); library(readr) })
+Sys.setenv(AUDIT_R_DIR = file.path(params$code, "R"))
+source(file.path(params$code, "R", "audit_functions.R"))
+source(file.path(params$code, "R", "run_job.R"))   # object and job definitions only; does not run a job when sourced
+# DESeq2 dependencies (S4Vectors etc.) mask some dplyr verbs; pin them
+rename <- dplyr::rename; select <- dplyr::select; filter <- dplyr::filter; mutate <- dplyr::mutate
+summarise <- dplyr::summarise; arrange <- dplyr::arrange; transmute <- dplyr::transmute; first <- dplyr::first
+OUT <- params$out
+TAB <- file.path(OUT, "tables"); dir.create(TAB, showWarnings = FALSE, recursive = TRUE)
+SRC <- file.path(OUT, "source_data"); dir.create(SRC, showWarnings = FALSE, recursive = TRUE)
+V38 <- "1.38.3"; V46 <- "1.46.0"
+cache <- function(ver, job) { f <- file.path(OUT, "cache", ver, paste0(job, ".rds")); if (file.exists(f)) readRDS(f) else NULL }
+wcsv <- function(x, name) { write_csv(x, file.path(TAB, name), na = ""); invisible(x) }
+jac <- function(a, b) if (length(union(a, b)) == 0) NA_real_ else length(intersect(a, b)) / length(union(a, b))
+annot <- read_tsv("/atium/Data/projects/sheridansinglecell/ref_files/gencodevM32_annotes.tsv", show_col_types = FALSE)
+tx2name <- setNames(annot$Transcript_Name, annot$Transcript); tx2gene <- setNames(annot$Gene, annot$Transcript)
+name2tx <- setNames(annot$Transcript, annot$Transcript_Name)
+PUB <- "/atium/Data/projects/sheridansinglecell/R2C2/Data"
+pub_genes <- read_tsv(file.path(PUB, "experience_sig_genes.tsv"), show_col_types = FALSE)
+pub_isos  <- read_tsv(file.path(PUB, "experience_sig_isoforms_p25.tsv"), show_col_types = FALSE)
+# NB: in this file the column names are swapped: Transcript_ID holds names (Fos-201), Transcript_Name holds ENSMUST IDs.
+pub_isos <- pub_isos %>% rename(tx_name = Transcript_ID, tx_id = Transcript_Name)
+pub_time_genes <- read_tsv(file.path(PUB, "time_sig_genes.tsv"), show_col_types = FALSE)
+pub_time_isos  <- read_tsv(file.path(PUB, "time_sig_isos.tsv"), show_col_types = FALSE)
+pub_ct_genes   <- read_tsv(file.path(PUB, "cond_time_sig_genes.tsv"), show_col_types = FALSE)
+pub_ct_isos    <- read_tsv(file.path(PUB, "cond_time_sig_isoforms.tsv"), show_col_types = FALSE)
+key_ct <- function(key) sub("^(gene|txsc|txgc)_", "", key)
+```
+
+All model fits are cached by `R/run_job.R` (one job per model and object) under `r OUT`/cache/<DESeq2 version>/.
+DESeq2 1.38.3 jobs run on winry with Sheridan's R 4.2.2 library (read-only, `R_LIBS_USER`); DESeq2 1.46.0 jobs run on zoro
+in the `r2r_doublets` conda env. This document only reads those caches and Sheridan's saved objects.
+
+```{r cache-status}
+jt <- job_table()
+st <- data.frame(job = jt$job,
+  v1.38.3 = file.exists(file.path(OUT, "cache", V38, paste0(jt$job, ".rds"))),
+  v1.46.0 = file.exists(file.path(OUT, "cache", V46, paste0(jt$job, ".rds"))))
+cat("cached jobs: 1.38.3 =", sum(st$v1.38.3), " 1.46.0 =", sum(st$v1.46.0), " (of", nrow(st), "job names)\n")
+```
+
+# 1. Inventory of saved DE objects
+
+```{r inventory}
+inv <- list(); mouse_tabs <- list(); ranks <- list()
+for (k in objects$key) {
+  x <- cache(V38, paste0("stored__", k)); if (is.null(x)) next
+  i <- x$inventory
+  i <- lapply(i, function(v) if (length(v) == 0 || is.null(v)) NA else if (length(v) > 1) paste(v, collapse = ";") else v)
+  inv[[k]] <- data.frame(key = k, celltype = x$celltype, level = x$level, i, check.names = FALSE)
+  mouse_tabs[[k]] <- x$mouse_table
+  ranks[[k]] <- do.call(rbind, lapply(names(x$ranks), function(n) data.frame(key = k, model = n, as.data.frame(x$ranks[[n]]))))
+}
+inventory <- bind_rows(inv)
+inventory$used_for <- with(inventory, ifelse(key %in% exp_keys & key %in% time_keys, "experience lists; time models",
+                                       ifelse(key %in% exp_keys, "experience lists; five-level time model",
+                                       ifelse(key %in% time_keys, "within-condition time models; Fig 6 expressed-isoform sets",
+                                       ifelse(key == "allnaive_type", "cell-type-variable isoforms (Fig 5, Supp Data 4)", "")))))
+# objects that are not DESeqDataSets
+extra <- list()
+tg <- readRDS(file.path(PUB, "CA1/tx_se_GRCref.rds"))
+extra$tx_se_GRCref <- data.frame(key = "CA1_tx_se_GRCref", celltype = "CA1", level = "isoform", object = file.path(PUB, "CA1/tx_se_GRCref.rds"),
+  class = class(tg)[1], n_features = nrow(tg), n_cells = ncol(tg), fitted = FALSE,
+  colData_cols = paste(colnames(colData(tg)), collapse = ";"), used_for = "Fig S21 tSNE (Figure_7_plotting.Rmd)")
+el <- readRDS(file.path(PUB, "CA1/engram_list.rds"))
+extra$engram <- data.frame(key = "CA1_engram_list", celltype = "CA1", level = "cells", object = file.path(PUB, "CA1/engram_list.rds"),
+  class = class(el)[1], n_cells = length(el), fitted = FALSE, used_for = "Fig 4C/4D/4E, S21B/C engram labels")
+cmp_file <- file.path(OUT, "logs", "allnaive_cmp.txt")
+allnaive_same <- if (file.exists(cmp_file)) any(grepl("^exit 0", readLines(cmp_file))) else NA
+extra$allnaive_copy <- data.frame(key = "allnaive_copy_files_for_resub", celltype = "all_naive", level = "isoform",
+  object = "/atium/Data/projects/sheridansinglecell/files_for_resub/allnaivecells_isoform_by_type.rds", class = "DESeqDataSet",
+  fitted = NA, used_for = paste0("byte-identical to R2C2/Data copy: ", allnaive_same,
+  ". Figure_5_plotting.Rmd reads a path that does not exist (2025_sc_figure_plotting/); both existing copies were checked"))
+inventory <- bind_rows(inventory, bind_rows(extra))
+wcsv(inventory, "table1_object_inventory.csv")
+mouse_table <- mouse_tabs[["gene_CA1"]]; rownames(mouse_table) <- NULL
+mkey <- function(m) paste(m$orig.ident, as.character(m$condition), m$sex, m$batch)
+same_mouse <- sapply(mouse_tabs, function(m) all(mkey(m) %in% mkey(mouse_table)))
+wcsv(mouse_table %>% arrange(batch, orig.ident), "table1b_mouse_metadata_from_objects.csv")
+design_ranks <- bind_rows(ranks)
+wcsv(design_ranks, "table3d_design_rank.csv")
+inventory %>% select(key, n_features, n_cells, fitted, design, full_model, reduced_model, baseline, sf_all_one,
+                     sf_maxlogdiff_ratio, dispersion_fitType, dup_mcols) %>% knitr::kable()
+cat("mouse -> condition/sex/batch mapping identical across objects:", all(same_mouse), "\n")
+knitr::kable(mouse_table %>% arrange(batch, orig.ident))
+```
+
+# 2/3. Experience models: stored fit, Sheridan's call, clean refits
+
+```{r experience-load}
+exp_models <- list(
+  stored        = list(ver = V38, an = "stored"),
+  sheridan_1.38.3 = list(ver = V38, an = "exp_sheridan"),
+  scaled_1.38.3 = list(ver = V38, an = "exp_scaled"), scaled_1.46.0 = list(ver = V46, an = "exp_scaled"),
+  sbc_1.38.3    = list(ver = V38, an = "exp_sbc"),    sbc_1.46.0    = list(ver = V46, an = "exp_sbc"),
+  ssbc_1.38.3   = list(ver = V38, an = "exp_ssbc"),   ssbc_1.46.0   = list(ver = V46, an = "exp_ssbc"))
+model_desc <- c(stored = "saved object (fit 1.38.3): ~ scaled + condition vs ~ scaled",
+  sheridan_1.38.3 = "Sheridan's call as written: DESeqDataSet(saved, ~ sex + batch + condition) + DESeq(LRT, ~ sex + batch)",
+  scaled_1.38.3 = "clean refit ~ scaled + condition vs ~ scaled", scaled_1.46.0 = "clean refit ~ scaled + condition vs ~ scaled",
+  sbc_1.38.3 = "clean refit ~ sex + batch + condition vs ~ sex + batch (Methods)", sbc_1.46.0 = "clean refit ~ sex + batch + condition vs ~ sex + batch (Methods)",
+  ssbc_1.38.3 = "clean refit ~ scaled + sex + batch + condition vs ~ scaled + sex + batch", ssbc_1.46.0 = "clean refit ~ scaled + sex + batch + condition vs ~ scaled + sex + batch")
+get_exp <- function(model, key) {
+  m <- exp_models[[model]]; x <- cache(m$ver, paste0(m$an, "__", key)); if (is.null(x)) return(NULL)
+  r <- x$results
+  r$label <- assign_experience(r$padj, r$lfc_CvU, r$lfc_CvN, r$lfc_UvN)
+  r$model <- model; r$key <- key; r$celltype <- key_ct(key); r$level <- ifelse(grepl("^gene_", key), "gene", "isoform")
+  attr(r, "meta") <- x$meta; r
+}
+E <- list()
+for (k in exp_keys) for (m in names(exp_models)) { r <- get_exp(m, k); if (!is.null(r)) E[[paste(m, k)]] <- r }
+sig_tab <- function(r) r[!is.na(r$label), c("feature", "label", "padj")]
+```
+
+## 2a. Provenance of the published experience lists
+
+For each cell type we match the published list (feature set, experience label, q-value) against (a) `results()` on the
+stored fit, (b) Sheridan's call as written, and (c) a clean refit of the model the Methods describe.
+
+```{r provenance-experience}
+pub_list <- function(key) {
+  ct <- key_ct(key)
+  if (grepl("^gene_", key)) {
+    p <- pub_genes %>% filter(Cell_type == ct) %>% transmute(feature = Gene_Name, label = Experience, q = Q_val)
+  } else {
+    p <- pub_isos %>% filter(Cell_type == ct) %>% transmute(feature = tx_id, label = Experience, q = Q_val)
+  }
+  p
+}
+cmp_pub <- function(p, r) {
+  if (is.null(r)) return(data.frame(n_model = NA, jaccard = NA, n_shared = NA, label_agree = NA, max_abs_q_diff = NA))
+  s <- sig_tab(r)
+  sh <- merge(p, s, by = "feature")
+  data.frame(n_model = nrow(s), jaccard = jac(p$feature, s$feature), n_shared = nrow(sh),
+             label_agree = if (nrow(sh)) mean(sh$label.x == sh$label.y) else NA,
+             max_abs_q_diff = if (nrow(sh)) max(abs(sh$q - sh$padj)) else NA)
+}
+prov <- list()
+for (k in exp_keys) {
+  p <- pub_list(k)
+  for (m in c("stored", "sheridan_1.38.3", "sbc_1.38.3", "sbc_1.46.0")) {
+    prov[[paste(k, m)]] <- data.frame(result = ifelse(grepl("^gene_", k), "Experience-variable genes (experience_sig_genes.tsv; Supp Data 6)",
+                                                     "Experience-variable isoforms (experience_sig_isoforms_p25.tsv; Supp Data 6)"),
+      celltype = key_ct(k), object = objects$path[objects$key == k], model = m, model_description = model_desc[[m]],
+      n_published = nrow(p), cmp_pub(p, E[[paste(m, k)]]))
+  }
+}
+prov_exp <- bind_rows(prov) %>% mutate(exact_match = (n_published == 0 & n_model %in% 0) |
+  (!is.na(jaccard) & jaccard == 1 & (is.na(label_agree) | label_agree == 1) & (is.na(max_abs_q_diff) | max_abs_q_diff < 1e-12)))
+prov_exp %>% group_by(result, model) %>% summarise(celltypes = n(), exact = sum(exact_match), .groups = "drop") %>% knitr::kable()
+```
+
+```{r sheridan-mechanism}
+# Mechanism check: in Sheridan's call the fresh fit sits in the LAST copy of each duplicated mcols column,
+# while results() reads the FIRST copy (the stored fit).
+mech <- bind_rows(lapply(exp_keys, function(k) {
+  s <- E[[paste("sheridan_1.38.3", k)]]; st <- E[[paste("stored", k)]]; cl <- E[[paste("sbc_1.38.3", k)]]
+  if (is.null(s) || is.null(st)) return(NULL)
+  data.frame(key = k, dup_mcols = attr(s, "meta")$n_dup_mcols,
+    max_diff_resultsP_vs_storedP = max(abs(s$pvalue - st$pvalue), na.rm = TRUE),
+    max_diff_resultsLFC_vs_storedLFC = max(abs(s$lfc_CvU - st$lfc_CvU), na.rm = TRUE),
+    max_diff_lastcopyP_vs_cleanSBC = if (!is.null(cl)) max(abs(s$LRTPvalue_last - cl$LRTPvalue_last), na.rm = TRUE) else NA)
+}))
+knitr::kable(mech)
+```
+
+## 2b. Figure panels read directly from stored fits
+
+```{r provenance-figures}
+fig_rows <- list()
+add_fig <- function(result, celltype, key, call, note) fig_rows[[length(fig_rows) + 1]] <<- data.frame(result = result, celltype = celltype,
+  object = objects$path[objects$key == key], call = call, model = "stored", model_description = model_desc[["stored"]], note = note)
+add_fig("Fig 3D (CA1 C+ vs U+N volcano)", "CA1", "gene_CA1", "Figure_3_plotting.Rmd L404-417: results(dds) on saved object",
+        "q-values are the stored ~ scaled + condition LRT; x-axis is a hand-computed ratio of normalized means")
+add_fig("CA1 C+U+ vs N volcano (Fig S12 per brief)", "CA1", "gene_CA1", "Figure_3_plotting.Rmd L750-763: results(dds) on saved object", "same stored LRT q-values")
+add_fig("Olig C+ vs U+N volcano (Fig S15 per brief)", "Olig", "gene_Olig", "Figure_3_plotting.Rmd L1012-1025: results(dds) on saved object", "stored Olig ~ scaled + condition LRT")
+add_fig("Fig 3C / radial plots, upset plot", "all", "gene_CA1", "Figure_3_plotting.Rmd L312ff: colour from experience_sig_genes.tsv", "inherit the provenance of the experience gene list")
+fig_prov <- bind_rows(fig_rows)
+# Fig 3D numbers under each model, CA1
+f3 <- bind_rows(lapply(c("stored", "sbc_1.38.3", "sbc_1.46.0", "ssbc_1.46.0"), function(m) { r <- E[[paste(m, "gene_CA1")]]
+  if (is.null(r)) return(NULL); data.frame(model = m, n_q05 = sum(r$padj < .05, na.rm = TRUE), Plp1_q = r$padj[r$feature == "Plp1"], Fos_q = r$padj[r$feature == "Fos"]) }))
+knitr::kable(f3)
+```
+
+## 2c. Cell-type-variable isoforms (Fig 5, Supp Data 4)
+
+```{r provenance-celltype}
+an <- cache(V38, "stored__allnaive_type")
+ct_prov <- NULL
+if (!is.null(an)) {
+  ctsig <- read_tsv("/atium/Data/projects/sheridansinglecell/Fig2/cell_type_sigs.tsv", show_col_types = FALSE)
+  r <- an$results; s <- r[!is.na(r$padj) & r$padj < .05, ]
+  sh <- merge(data.frame(feature = ctsig$isoform, q = ctsig$qval), s, by = "feature")
+  ct_prov <- data.frame(result = "Cell-type-variable isoforms (Fig 5; Supp Data 4 via Fig2/cell_type_sigs.tsv)", celltype = "all naive cells",
+    object = an$object, model = "stored", model_description = paste(an$inventory$full_model, "vs", an$inventory$reduced_model),
+    n_published = nrow(ctsig), n_model = nrow(s), jaccard = jac(ctsig$isoform, s$feature), n_shared = nrow(sh),
+    max_abs_q_diff = if (nrow(sh)) max(abs(sh$q - sh$padj)) else NA,
+    note = "Figure_5_plotting.Rmd L33-42 calls results() on the saved fit; the fit is not redone")
+  for (v in c(V38, V46)) { y <- cache(v, "celltype_bt__allnaive_type"); if (is.null(y)) next
+    yr <- y$results; ys <- yr[!is.na(yr$padj) & yr$padj < .05, ]; sh2 <- merge(data.frame(feature = ctsig$isoform, q = ctsig$qval), ys, by = "feature")
+    ct_prov <- bind_rows(ct_prov, data.frame(result = ct_prov$result[1], celltype = "all naive cells", object = an$object,
+      model = paste0("clean_bt_", v), model_description = "clean refit ~ batch + type vs ~ batch (~ sex + batch + type is not full rank in naive cells: sex aliased with batch F)",
+      n_published = nrow(ctsig), n_model = nrow(ys), jaccard = jac(ctsig$isoform, ys$feature), n_shared = nrow(sh2),
+      max_abs_q_diff = if (nrow(sh2)) max(abs(sh2$q - sh2$padj)) else NA, note = "")) }
+  knitr::kable(ct_prov)
+}
+```
+
+## 2d. Time models (Fig S9, Reviewer 2 #3)
+
+```{r provenance-time}
+get_res <- function(ver, an, key) { x <- cache(ver, paste0(an, "__", key)); if (is.null(x)) NULL else x$results }
+time_label <- function(lfc) ifelse(lfc > .25, "60 min", ifelse(lfc < -.25, "10 min", "Log2 < .25"))
+tp <- list()
+for (k in time_keys) {
+  ct <- key_ct(k); lev <- ifelse(grepl("^gene_", k), "gene", "isoform")
+  for (cc in c("C+", "U+")) {
+    p <- if (lev == "gene") pub_time_genes %>% filter(Cell_type == ct, Experience == cc) %>% transmute(feature = Gene_Name, q = Q_val, tl = Timepoint)
+         else pub_time_isos %>% filter(Cell_type == ct, Experience == cc) %>% transmute(feature = Transcript_ID, q = Q_val, tl = Timepoint)
+    an_s <- ifelse(cc == "C+", "timeC_sheridan", "timeU_sheridan"); an_c <- ifelse(cc == "C+", "timeC_clean", "timeU_clean")
+    for (mm in list(c("stored", V38, "stored"), c("sheridan_1.38.3", V38, an_s), c("clean_1.38.3", V38, an_c), c("clean_1.46.0", V46, an_c))) {
+      r <- get_res(mm[2], mm[3], k); if (is.null(r)) next
+      s <- r[!is.na(r$padj) & r$padj < .05, ]
+      sh <- merge(p, s, by = "feature")
+      tp[[paste(k, cc, mm[1])]] <- data.frame(result = paste0("Within-condition time model, ", cc, " (time_sig_", ifelse(lev == "gene", "genes", "isos"), ".tsv)"),
+        celltype = ct, level = lev, object = objects$path[objects$key == k], model = mm[1], n_published = nrow(p), n_model = nrow(s),
+        jaccard = jac(p$feature, s$feature), n_shared = nrow(sh), max_abs_q_diff = if (nrow(sh)) max(abs(sh$q - sh$padj)) else NA,
+        timepoint_label_agree = if (nrow(sh) && mm[1] != "stored") mean(sh$tl == time_label(sh$lfc_T1v0)) else NA)
+    }
+  }
+}
+for (k in exp_keys) {
+  ct <- key_ct(k); lev <- ifelse(grepl("^gene_", k), "gene", "isoform")
+  ctn <- if (lev == "gene") ct else ct
+  p <- if (lev == "gene") pub_ct_genes %>% filter(Celltype == ctn) %>% transmute(feature = Gene, q = Qval)
+       else pub_ct_isos %>% filter(Celltype == ctn) %>% transmute(feature = Transcript, q = Qval)
+  for (mm in list(c("stored", V38, "stored"), c("sheridan_1.38.3", V38, "condtime_sheridan"), c("clean_1.38.3", V38, "condtime_clean"), c("clean_1.46.0", V46, "condtime_clean"))) {
+    r <- get_res(mm[2], mm[3], k); if (is.null(r)) next
+    s <- r[!is.na(r$padj) & r$padj < .05, ]; sh <- merge(p, s, by = "feature")
+    tp[[paste(k, "ct", mm[1])]] <- data.frame(result = paste0("Five-level condition_time model (cond_time_sig_", ifelse(lev == "gene", "genes", "isoforms"), ".tsv)"),
+      celltype = ct, level = lev, object = objects$path[objects$key == k], model = mm[1], n_published = nrow(p), n_model = nrow(s),
+      jaccard = jac(p$feature, s$feature), n_shared = nrow(sh), max_abs_q_diff = if (nrow(sh)) max(abs(sh$q - sh$padj)) else NA)
+  }
+}
+prov_time <- bind_rows(tp)
+prov_time %>% group_by(result, model) %>% summarise(celltypes = n(), median_jaccard = median(jaccard, na.rm = TRUE),
+  exact = sum(jaccard == 1 & (is.na(max_abs_q_diff) | max_abs_q_diff < 1e-12), na.rm = TRUE), .groups = "drop") %>% knitr::kable()
+```
+
+```{r provenance-write}
+eng_prov <- data.frame(result = c("Fig 4C/4D engram-variable genes", "Fig S21B engram-variable isoforms"), celltype = "CA1",
+  object = c(objects$path[objects$key == "gene_CA1"], objects$path[objects$key == "txsc_CA1"]),
+  call = c("Figure_4_plotting.Rmd L149-160: DESeqDataSet(saved, ~ sex + batch + engram); DESeq(LRT, ~ sex + batch); results(contrast engram)",
+           "Figure_7_plotting.Rmd L76-96: same pattern on CA1 tx_scaled_cond_nobatch.rds"),
+  model = "sheridan_1.38.3", note = "see section 4: q-values are the stored experience LRT; LFCs are from the engram fit")
+provenance <- bind_rows(
+  prov_exp %>% mutate(call = ifelse(grepl("genes", result), "DESeq2_analysis.Rmd L1398ff (wrap + DESeq + results)", "DESeq2_analysis.Rmd L122-1387 (wrap + DESeq + results)")),
+  fig_prov, ct_prov, eng_prov, prov_time)
+wcsv(provenance, "table2_provenance.csv")
+```
+
+## 3. Does the described model change anything?
+
+```{r refit-comparison}
+cls <- c("C+", "U+", "N", "C+U+", "C+N", "U+N", "Log2 < .25")
+rc <- list()
+for (k in exp_keys) {
+  st <- E[[paste("stored", k)]]
+  for (m in names(exp_models)) {
+    r <- E[[paste(m, k)]]; if (is.null(r)) next
+    s <- r$feature[!is.na(r$label)]; s0 <- st$feature[!is.na(st$label)]
+    row <- data.frame(celltype = key_ct(k), level = r$level[1], key = k, model = m, model_description = model_desc[[m]],
+      deseq2 = attr(r, "meta")$deseq2_version,
+      n_features = nrow(r), n_tested = sum(!r$allZero), n_cooks_removed = sum(!r$allZero & is.na(r$pvalue)),
+      n_removed_independent_filtering = sum(!is.na(r$pvalue) & is.na(r$padj)),
+      n_padj_nonNA = sum(!is.na(r$padj)), n_sig_q05 = sum(r$padj < .05, na.rm = TRUE),
+      jaccard_vs_published = jac(s, s0), n_shared_with_published = length(intersect(s, s0)),
+      n_lost_vs_published = length(setdiff(s0, s)), n_gained_vs_published = length(setdiff(s, s0)))
+    for (cl in cls) row[[paste0("n_", cl)]] <- sum(r$label == cl, na.rm = TRUE)
+    row$n_C_up <- sum(r$label %in% c("C+", "C+N", "C+U+")); row$n_CU <- sum(r$label == "C+U+", na.rm = TRUE)
+    rc[[paste(k, m)]] <- row
+  }
+}
+refit <- bind_rows(rc)
+wcsv(refit, "table3_refit_comparison.csv")
+refit %>% filter(model %in% c("stored", "sbc_1.38.3", "sbc_1.46.0", "ssbc_1.46.0")) %>%
+  select(celltype, level, model, n_sig_q05, jaccard_vs_published, n_C_up) %>%
+  tidyr::pivot_wider(names_from = model, values_from = c(n_sig_q05, jaccard_vs_published, n_C_up)) %>% knitr::kable(digits = 2)
+```
+
+### Paper numbers under each model
+
+```{r paper-numbers}
+expressed_tx <- function(key) { x <- cache(V38, paste0("stored__", key)); if (is.null(x)) return(NULL); x$results$feature[!x$results$allZero] }
+# Figure_6_plotting.Rmd: which object supplies the expressed-isoform set per cell type
+fig6_obj <- c(CA1 = "txsc_CA1", CA2 = "txsc_CA2", CA3 = "txsc_CA3", Astrocyte = "txsc_Astrocyte", Dentate_1 = "txsc_Dentate_1",
+  Dentate_2 = "txsc_Dentate_2", Dentate_3 = "txsc_Dentate_3", Endothelial = "txsc_Endothelial", Microglia = "txsc_Microglia",
+  Neuroblast = "txsc_Neuroblast", Olig_1 = "txsc_Olig_1", Olig_2 = "txgc_Olig_2", OPC = "txsc_OPC", Pericyte = "txgc_Pericyte",
+  Progenitor = "txgc_Progenitor", Inhibitory = "txsc_Inhibitory")   # Inhibitory: Figure_6 adds a 0,0,0 row; we use its own object if a refit gives it isoforms
+EXPR <- lapply(fig6_obj, expressed_tx)
+iso_only_median <- function(iso, gen) {
+  # iso: data.frame(celltype, feature=ENSMUST); gen: data.frame(celltype, feature=gene)
+  iso$gene <- tx2gene[iso$feature]
+  pcts <- c()
+  for (ct in unique(iso$celltype)) {
+    ex <- EXPR[[ct]]; exg <- tx2gene[ex]
+    gct <- if (ct %in% c("Olig_1", "Olig_2")) "Olig" else ct
+    gl <- gen$feature[gen$celltype == gct]
+    n1 <- n2 <- n3 <- 0
+    for (g in iso$gene[iso$celltype == ct]) { nt <- sum(exg == g, na.rm = TRUE)
+      if (nt == 1) n1 <- n1 + 1 else if (nt > 1) { if (g %in% gl) n3 <- n3 + 1 else n2 <- n2 + 1 } }
+    pcts[ct] <- 100 * n2 / (n1 + n2 + n3)
+  }
+  if (!("Inhibitory" %in% names(pcts))) pcts["Inhibitory"] <- 0   # Figure_6 adds Inhibitory with 0,0,0
+  if (any(sapply(EXPR[unique(iso$celltype)], is.null))) return(c(median_iso_only_pct = NA, n_celltypes = length(pcts)))
+  c(median_iso_only_pct = median(pcts, na.rm = TRUE), n_celltypes = length(pcts))
+}
+pn <- list()
+for (m in names(exp_models)) {
+  g <- bind_rows(lapply(exp_gene_keys, function(k) { r <- E[[paste(m, k)]]; if (is.null(r)) NULL else data.frame(celltype = key_ct(k), feature = r$feature, label = r$label) })) %>% filter(!is.na(label))
+  i <- bind_rows(lapply(exp_iso_keys, function(k) { r <- E[[paste(m, k)]]; if (is.null(r)) NULL else data.frame(celltype = key_ct(k), feature = r$feature, label = r$label, padj = r$padj) })) %>% filter(!is.na(label))
+  if (nrow(g) == 0 || nrow(i) == 0) next
+  ca1 <- g %>% filter(celltype == "CA1")
+  cup <- sum(ca1$label %in% c("C+", "C+N", "C+U+")); cu <- sum(ca1$label == "C+U+")
+  med <- iso_only_median(i, g)
+  getl <- function(df, ct, f) { x <- df[df$celltype == ct & df$feature == f, ]; if (nrow(x)) x$label[1] else "not significant" }
+  pn[[m]] <- data.frame(model = m, CA1_genes_q05 = nrow(ca1), CA1_C_up = cup, CA1_C_up_and_U_up = cu, pct_C_up_also_U_up = round(100 * cu / cup, 1),
+    iso_rows = nrow(i), iso_unique = length(unique(i$feature)), iso_unique_genes = length(unique(tx2gene[i$feature])),
+    iso_celltypes = length(unique(i$celltype)), iso_celltypes_olig_merged = length(unique(sub("^Olig_[12]$", "Olig", i$celltype))), median_iso_only_pct = round(med[["median_iso_only_pct"]], 1),
+    gene_celltypes = length(unique(g$celltype)), gene_rows = nrow(g))
+}
+paper_numbers <- bind_rows(pn)
+paper_ref <- data.frame(model = "paper", CA1_genes_q05 = 597, CA1_C_up = 250, CA1_C_up_and_U_up = 219, pct_C_up_also_U_up = 87.6,
+  iso_rows = 1972, iso_unique = 1266, iso_unique_genes = 1217, iso_celltypes_olig_merged = 14, median_iso_only_pct = 21.3)
+paper_numbers <- bind_rows(paper_ref, paper_numbers)
+wcsv(paper_numbers, "table3b_paper_numbers.csv")
+knitr::kable(paper_numbers)
+```
+
+### Featured genes and isoforms
+
+```{r featured}
+feat <- data.frame(level = c("gene", "gene", "gene", rep("isoform", 5)),
+  key = c("gene_CA1", "gene_CA1", "gene_Olig", rep("txsc_CA1", 5)),
+  name = c("Fos", "Plp1", "Sgk1", "Fos-201", "Baiap2-204", "Arpc2-201", "Arpc2-203", "Syngap1-204"))
+feat$feature <- ifelse(feat$level == "gene", feat$name, name2tx[feat$name])
+ff <- list()
+for (j in seq_len(nrow(feat))) for (m in names(exp_models)) {
+  r <- E[[paste(m, feat$key[j])]]; if (is.null(r)) next
+  x <- r[match(feat$feature[j], r$feature), ]   # NA row if the feature is absent from the object
+  ff[[paste(j, m)]] <- data.frame(feat[j, ], model = m, baseMean = x$baseMean, padj = x$padj, pvalue = x$pvalue,
+    label = ifelse(is.na(x$label), "not significant", x$label), lfc_CvU = x$lfc_CvU, lfc_CvN = x$lfc_CvN, lfc_UvN = x$lfc_UvN,
+    maxCooks = x$maxCooks_last, cooks_removed = !x$allZero & is.na(x$pvalue),
+    removed_by_independent_filtering = !is.na(x$pvalue) & is.na(x$padj))
+}
+featured <- bind_rows(ff)
+wcsv(featured, "table3c_featured_features.csv")
+featured %>% select(name, model, padj, label, cooks_removed, removed_by_independent_filtering) %>% knitr::kable(digits = 4)
+```
+
+### Baseline level
+
+```{r baseline}
+bl <- list()
+for (k in c("gene_CA1", "txsc_CA1")) for (pr in list(c("scaled", "exp_scaled", "exp_scaled_N"), c("sbc", "exp_sbc", "exp_sbc_N"))) for (v in c(V38, V46)) {
+  a <- cache(v, paste0(pr[2], "__", k)); b <- cache(v, paste0(pr[3], "__", k)); if (is.null(a) || is.null(b)) next
+  la <- assign_experience(a$results$padj, a$results$lfc_CvU, a$results$lfc_CvN, a$results$lfc_UvN)
+  lb <- assign_experience(b$results$padj, b$results$lfc_CvU, b$results$lfc_CvN, b$results$lfc_UvN)
+  bl[[paste(k, pr[1], v)]] <- data.frame(key = k, model = pr[1], deseq2 = v,
+    max_abs_diff_pvalue = max(abs(a$results$pvalue - b$results$pvalue), na.rm = TRUE),
+    same_NA_pattern = identical(is.na(a$results$padj), is.na(b$results$padj)),
+    max_abs_diff_lfc_CvU = max(abs(a$results$lfc_CvU - b$results$lfc_CvU), na.rm = TRUE),
+    identical_labels = identical(la, lb),
+    n_features_pvalue_diff_gt_1e6 = sum(abs(a$results$pvalue - b$results$pvalue) > 1e-6, na.rm = TRUE),
+    n_sig_status_changed = sum(xor(a$results$padj < .05 & !is.na(a$results$padj), b$results$padj < .05 & !is.na(b$results$padj))),
+    n_label_changed = sum((is.na(la) != is.na(lb)) | (!is.na(la) & !is.na(lb) & la != lb)),
+    changed_features = paste(head(a$results$feature[which((is.na(la) != is.na(lb)) | (!is.na(la) & !is.na(lb) & la != lb))], 10), collapse = ";"),
+    median_baseMean_of_pdiff_features = median(a$results$baseMean[abs(a$results$pvalue - b$results$pvalue) > 1e-6], na.rm = TRUE))
+}
+baseline <- bind_rows(bl); wcsv(baseline, "table3e_baseline_check.csv"); knitr::kable(baseline)
+```
+
+# 4. Engram refits (A11)
+
+```{r engram}
+eng_models <- list(sheridan_1.38.3 = c(V38, "engram_sheridan"), sheridan_1.46.0 = c(V46, "engram_sheridan"),
+  sbe_1.38.3 = c(V38, "engram_sbe"), sbe_1.46.0 = c(V46, "engram_sbe"), sbce_1.38.3 = c(V38, "engram_sbce"), sbce_1.46.0 = c(V46, "engram_sbce"))
+eng_desc <- c(sheridan = "Sheridan's call: wrap saved fit, ~ sex + batch + engram vs ~ sex + batch",
+  sbe = "clean ~ sex + batch + engram vs ~ sex + batch", sbce = "clean ~ sex + batch + condition + engram vs ~ sex + batch + condition")
+eng_feat <- list(gene_CA1 = c("Fos", "Junb", "Egr1", "Egr4", "Plp1"),
+                 txsc_CA1 = c("Fos-201", "Egr1-201", "Junb-201", "Egr4-201", "Plp1-201", "Arpc2-201"))
+EG <- list(); ec <- list(); ef <- list()
+for (k in names(eng_feat)) for (m in names(eng_models)) {
+  x <- cache(eng_models[[m]][1], paste0(eng_models[[m]][2], "__", k)); if (is.null(x)) next
+  r <- x$results; EG[[paste(m, k)]] <- r
+  up <- r$feature[!is.na(r$padj) & r$padj < .05 & r$lfc_EvN > .25]; dn <- r$feature[!is.na(r$padj) & r$padj < .05 & r$lfc_EvN < -.25]
+  nz <- !r$allZero
+  ec[[paste(m, k)]] <- data.frame(key = k, model = m, model_description = eng_desc[[sub("_1\\..*$", "", m)]], deseq2 = x$deseq2,
+    n_tested = sum(nz), n_cooks_removed = sum(nz & is.na(r$pvalue)), cooks_cutoff = x$meta$cooks_cutoff,
+    n_q05 = sum(r$padj < .05, na.rm = TRUE), n_engram_up = length(up), n_engram_down = length(dn),
+    n_removed_independent_filtering = sum(!is.na(r$pvalue) & is.na(r$padj)),
+    n_q05_no_cooks_BH = sum(p.adjust(r$LRTPvalue_last[nz], "BH") < .05, na.rm = TRUE),
+    dup_mcols = x$meta$n_dup_mcols)
+  for (f in eng_feat[[k]]) { id <- if (k == "gene_CA1") f else name2tx[[f]]; y <- r[match(id, r$feature), ]
+    ef[[paste(m, k, f)]] <- data.frame(level = ifelse(k == "gene_CA1", "gene", "isoform"), name = f, feature = id, model = m, deseq2 = x$deseq2,
+      log2FC_engram = y$lfc_EvN, padj = y$padj, pvalue = y$pvalue, raw_LRT_p_own_fit = y$LRTPvalue_last,
+      maxCooks_own_fit = y$maxCooks_last, cooks_cutoff = x$meta$cooks_cutoff,
+      cooks_removed = !y$allZero & is.na(y$pvalue), removed_by_independent_filtering = !is.na(y$pvalue) & is.na(y$padj), engram_variable = !is.na(y$padj) & y$padj < .05 & abs(y$lfc_EvN) > .25) }
+}
+engram_counts <- bind_rows(ec); engram_feats <- bind_rows(ef)
+wcsv(engram_feats, "table4_engram_refits.csv"); wcsv(engram_counts, "table4b_engram_counts.csv")
+knitr::kable(engram_counts, digits = 3)
+knitr::kable(engram_feats %>% select(name, model, log2FC_engram, padj, maxCooks_own_fit, cooks_cutoff, cooks_removed, engram_variable), digits = 4)
+```
+
+```{r engram-panels}
+# Fig 4E (gene) and S21C (isoform) correlation panels are built from the engram-variable list (q < .05, |LFC| > .25).
+dg <- readRDS(file.path(PUB, "CA1/genes_scaled_cond_nobatch.rds")); ng <- counts(dg, normalized = TRUE); rm(dg)
+dt <- readRDS(file.path(PUB, "CA1/tx_scaled_cond_nobatch.rds")); nt <- counts(dt, normalized = TRUE); rm(dt); gc()
+panel <- function(r, nm, anchor, k) {
+  up <- r$feature[!is.na(r$padj) & r$padj < .05 & r$lfc_EvN > .25]; dn <- r$feature[!is.na(r$padj) & r$padj < .05 & r$lfc_EvN < -.25]
+  eg <- c(up, dn); if (!(anchor %in% eg)) return(list(genes = character(0), note = paste(anchor, "not engram-variable; panel cannot be ordered as coded")))
+  cm <- suppressWarnings(cor(t(as.matrix(nm[eg, , drop = FALSE])), method = "spearman"))
+  o <- order(cm[, anchor], decreasing = TRUE); ordered <- eg[o]
+  sel <- if (k == "gene_CA1") unique(c(head(ordered, 11), "Plp1", tail(ordered, 10))) else head(ordered, 15)
+  list(genes = sel, note = if (k == "gene_CA1" && !("Plp1" %in% eg)) "Plp1 is hard-coded into the Fig 4E panel but is not engram-variable" else "",
+       n_list = length(eg), cor = cm)
+}
+pp <- list()
+for (m in names(eng_models)) for (k in names(eng_feat)) {
+  r <- EG[[paste(m, k)]]; if (is.null(r)) next
+  anchor <- if (k == "gene_CA1") "Fos" else name2tx[["Fos-201"]]
+  p <- panel(r, if (k == "gene_CA1") ng else nt, anchor, k)
+  lab <- if (k == "gene_CA1") p$genes else unname(tx2name[p$genes])
+  pp[[paste(m, k)]] <- data.frame(panel = ifelse(k == "gene_CA1", "Fig 4E", "Fig S21C"), model = m, n_engram_variable = ifelse(is.null(p$n_list), 0, p$n_list),
+    panel_features = paste(lab, collapse = ";"), note = p$note)
+}
+panels <- bind_rows(pp); ref <- panels %>% filter(model == "sheridan_1.38.3") %>% select(panel, ref_features = panel_features)
+panels <- panels %>% left_join(ref, by = "panel") %>% mutate(same_as_published_call = panel_features == ref_features) %>% select(-ref_features)
+wcsv(panels, "table4c_correlation_panels.csv"); knitr::kable(panels)
+```
+
+```{r engram-source-data}
+# Source data so the volcano (4C, S21B) and radial colouring (4D) can be redrawn under the clean refits.
+dg <- readRDS(file.path(PUB, "CA1/genes_scaled_cond_nobatch.rds"))
+nc <- log2(sapply(levels(dg$condition), function(l) rowMeans(counts(dg, normalized = TRUE)[, dg$condition == l, drop = FALSE])) + 1); rm(dg)
+cart <- function(r, t) c(r * cos(t * pi / 180), r * sin(t * pi / 180))
+xy <- t(apply(nc[rowSums(nc) > 0, c("Conditioned", "Naive", "Unconditioned")], 1, function(v) cart(v[1], 0) + cart(v[2], 120) + cart(v[3], 240)))
+lfc_class <- function(q, l) ifelse(is.na(q) | q >= .05, "ns", as.character(cut(l, c(-Inf, -1, -.5, -.25, 0, .25, .5, 1, Inf),
+  labels = c("< -1", "< -.5", "< -.25", "< 0", "> 0", "> .25", "> .5", "> 1"))))
+for (m in setdiff(names(eng_models), c("sheridan_1.46.0"))) for (k in names(eng_feat)) {
+  r <- EG[[paste(m, k)]]; if (is.null(r)) next
+  v <- data.frame(feature = r$feature, name = if (k == "gene_CA1") r$feature else unname(tx2name[r$feature]), log2FC = r$lfc_EvN, qval = r$padj,
+    colour = ifelse(!is.na(r$padj) & r$padj < .05 & r$lfc_EvN > .25, "engram", ifelse(!is.na(r$padj) & r$padj < .05 & r$lfc_EvN < -.25, "non-engram", "ns"))) %>% filter(!is.na(qval))
+  write_csv(v, file.path(SRC, paste0(ifelse(k == "gene_CA1", "fig4C_volcano_", "figS21B_volcano_"), m, ".csv")))
+  if (k == "gene_CA1") {
+    d4 <- data.frame(gene = rownames(xy), x = xy[, 1], y = xy[, 2]); d4 <- merge(d4, r[, c("feature", "padj", "lfc_EvN")], by.x = "gene", by.y = "feature", all.x = TRUE)
+    d4$engram_log2fc_class <- lfc_class(d4$padj, d4$lfc_EvN); write_csv(d4, file.path(SRC, paste0("fig4D_radial_", m, ".csv")))
+  }
+}
+list.files(SRC)
+```
+
+# 5. Engram threshold (M24)
+
+```{r threshold}
+th <- readRDS(file.path(OUT, "cache", "seurat_5.3.0", "engram_threshold.rds"))
+pc <- th$per_cell
+min_pos <- min(pc$fos_lognorm[pc$fos_lognorm > 0])
+thr <- bind_rows(
+  th$by_group_coded %>% mutate(threshold = "as coded: (mean + SD)/2", value = th$thr_coded),
+  th$by_group_z05 %>% mutate(threshold = "z > 0.5: mean + 0.5 SD", value = th$thr_z05)) %>%
+  mutate(fos_mean = th$fos_mean, fos_sd = th$fos_sd, scale_factor = th$scalef, z_equivalent_of_coded = th$z_of_coded_threshold,
+         min_nonzero_fos_lognorm = min_pos, n_cells_fos_detected = sum(pc$fos_lognorm > 0),
+         coded_set_identical_to_engram_list_rds = th$identical_to_saved, n_overlap_coded_z05 = th$n_both,
+         n_coded_only = th$n_coded_only, n_z05_only = th$n_z05_only, seurat = th$seurat)
+wcsv(thr, "table5_engram_threshold.csv"); knitr::kable(thr, digits = 4)
+```
+
+# 6. Filters and features tested (M25, R2-5a)
+
+```{r filters}
+seu_genes <- tryCatch({ s <- readRDS(file.path(PUB, "Seurat_objs/R2C2_combined_final.rds")); g <- rownames(s); rm(s); gc(); g }, error = function(e) NULL)
+n_annot_tx <- nrow(annot)
+fl <- list()
+for (k in exp_keys) {
+  x <- cache(V38, paste0("stored__", k)); if (is.null(x)) next
+  i <- x$inventory; r <- x$results; lev <- x$level
+  genes_in_seu <- if (lev == "gene" && !is.null(seu_genes)) mean(r$feature %in% seu_genes) else NA
+  filt <- if (lev == "gene") {
+    sprintf("Genes detected (>= 1 UMI) in >= 10 cells across the combined 17-sample object (Figure_3_plotting.Rmd L50-55); %s of genes in this object are in that set; no stricter per-cell-type filter (minimum detecting cells within %s = %s)",
+            ifelse(is.na(genes_in_seu), "NA", sprintf("%.1f%%", 100 * genes_in_seu)), key_ct(k), i$min_cells_detected_nonzero)
+  } else if (i$n_features_matrix == n_annot_tx) {
+    sprintf("INFERRED (object-building code not found): no expression filter; the matrix holds all %d GENCODE vM32 transcripts, %d of them all-zero in this cell type; DESeq2 drops all-zero rows; minimum detecting cells among the rest = %s",
+            n_annot_tx, i$n_allzero, i$min_cells_detected_nonzero)
+  } else {
+    sprintf("INFERRED (object-building code not found): %d of %d GENCODE vM32 transcripts present (%d all-zero in this cell type); minimum detecting cells among non-zero rows = %s",
+            i$n_features_matrix, n_annot_tx, i$n_allzero, i$min_cells_detected_nonzero)
+  }
+  fl[[k]] <- data.frame(celltype = key_ct(k), level = lev, object = x$object, n_cells = i$n_cells, prefilter = filt,
+    n_features_in_matrix = i$n_features_matrix, n_allzero_in_celltype = i$n_allzero, n_tested = sum(!r$allZero),
+    n_cooks_removed = sum(!r$allZero & is.na(r$pvalue)), n_removed_independent_filtering = sum(!is.na(r$pvalue) & is.na(r$padj)),
+    n_padj_nonNA = sum(!is.na(r$padj)), n_sig_q05 = sum(r$padj < .05, na.rm = TRUE),
+    n_detected_ge10_cells = i$n_detected_ge10, min_cells_detected = i$min_cells_detected_nonzero,
+    model = paste(i$full_model, "vs", i$reduced_model))
+}
+filters <- bind_rows(fl)
+# txsc objects (117,494 rows): compare with the union of transcripts detected in any txgc (all-transcript) object
+gc_union <- unique(unlist(lapply(grep("^txgc_", objects$key, value = TRUE), function(k) { x <- cache(V38, paste0("stored__", k)); if (is.null(x)) NULL else x$results$feature[!x$results$allZero] })))
+sc_rows <- cache(V38, "stored__txsc_CA1")$results$feature
+txsc_note <- sprintf("tx_scaled_cond_nobatch objects hold %d transcripts; %d of them are detected in at least one cell of at least one tx_se_gencode_LRT cell-type object (union = %d transcripts); %d are in GENCODE vM32",
+                     length(sc_rows), sum(sc_rows %in% gc_union), length(gc_union), sum(sc_rows %in% annot$Transcript))
+cat(txsc_note, "\n")
+filters$prefilter[filters$level == "isoform" & filters$n_features_in_matrix == length(sc_rows)] <- paste("INFERRED (object-building code not found):", txsc_note,
+  "; DESeq2 drops all-zero rows; minimum detecting cells among the rest = 1")
+gene_iso_cells <- inventory %>% filter(grepl("^(gene|txgc|txsc)_", key)) %>% select(key, celltype, n_cells)
+filters <- filters %>% left_join(gene_iso_cells %>% filter(grepl("^gene_", key)) %>% transmute(celltype, n_cells_gene_object = n_cells), by = "celltype")
+wcsv(filters, "table6_filters_features_tested.csv")
+knitr::kable(filters %>% select(-prefilter, -object))
+```
+
+# 7. Case B change list
+
+Every number and featured feature the paper quotes from these models, under each refit. Built from tables 3b, 3c, 4, 4b, 4c.
+
+```{r change-list}
+mods <- c("sbc_1.38.3", "sbc_1.46.0", "ssbc_1.38.3", "ssbc_1.46.0")
+pnx <- as.data.frame(paper_numbers); rownames(pnx) <- pnx$model
+num <- list(c("CA1 genes, q < 0.05", "Results, Fig 3", "CA1_genes_q05"), c("C+-up CA1 genes", "Results (250)", "CA1_C_up"),
+  c("C+-up CA1 genes also U+-up", "Results (219)", "CA1_C_up_and_U_up"), c("% of C+-up also U+-up", "Results (87.6%)", "pct_C_up_also_U_up"),
+  c("Experience-variable isoform rows", "Results (1,972)", "iso_rows"), c("Unique experience-variable isoforms", "Results (1,266)", "iso_unique"),
+  c("Genes with experience-variable isoforms", "Results (1,217)", "iso_unique_genes"),
+  c("Cell types with experience-variable isoforms (Olig_1/2 merged)", "Results (14)", "iso_celltypes_olig_merged"),
+  c("Median % isoforms from genes with no gene-level change", "Results, Fig 6 (21.3%)", "median_iso_only_pct"),
+  c("Experience-variable gene rows, all cell types", "Supp Data 6", "gene_rows"))
+cl <- list()
+for (n in num) { pub <- pnx["paper", n[3]]; if (is.na(pub)) pub <- pnx["stored", n[3]]
+  cl[[length(cl) + 1]] <- data.frame(item = n[1], where_in_paper = n[2], published = as.character(pub),
+    t(setNames(sapply(mods, function(m) if (m %in% rownames(pnx)) as.character(pnx[m, n[3]]) else NA), mods)), note = "", check.names = FALSE) }
+flab <- function(r) ifelse(r$cooks_removed %in% TRUE, "Cook's outlier (NA)", ifelse(r$removed_by_independent_filtering %in% TRUE, "independent filtering (NA)",
+  paste0(r$label, " (q ", signif(r$padj, 2), ")")))
+for (nm in unique(featured$name)) { g <- featured[featured$name == nm, ]
+  cl[[length(cl) + 1]] <- data.frame(item = paste(nm, "experience label"), where_in_paper = "Results / Figs 3, 6 (featured)",
+    published = flab(g[g$model == "stored", ]), t(setNames(sapply(mods, function(m) if (m %in% g$model) flab(g[g$model == m, ]) else NA), mods)), note = "", check.names = FALSE) }
+elab <- function(r) ifelse(r$cooks_removed %in% TRUE, "Cook's outlier", ifelse(r$removed_by_independent_filtering %in% TRUE, "independent filtering",
+  ifelse(r$engram_variable, paste0(ifelse(r$log2FC_engram > 0, "up", "down"), " (q ", signif(r$padj, 2), ")"), paste0("ns (q ", signif(r$padj, 2), ")"))))
+for (k in c("gene_CA1", "txsc_CA1")) { g <- engram_counts[engram_counts$key == k, ]; pubr <- g[g$model == "sheridan_1.38.3", ]
+  cl[[length(cl) + 1]] <- data.frame(item = ifelse(k == "gene_CA1", "Engram-variable CA1 genes", "Engram-variable CA1 isoforms"),
+    where_in_paper = ifelse(k == "gene_CA1", "Results, Fig 4C/4D", "Results, Fig S21B"),
+    published = sprintf("%d (%d up / %d down)", pubr$n_engram_up + pubr$n_engram_down, pubr$n_engram_up, pubr$n_engram_down),
+    t(setNames(rep(NA, 4), mods)), note = paste(sprintf("%s: %d (%d/%d), q<0.05 %d", g$model, g$n_engram_up + g$n_engram_down, g$n_engram_up, g$n_engram_down, g$n_q05)[!grepl("sheridan", g$model)], collapse = "; "), check.names = FALSE) }
+for (nm in unique(engram_feats$name)) { g <- engram_feats[engram_feats$name == nm, ]
+  cl[[length(cl) + 1]] <- data.frame(item = paste(nm, "in engram cells"), where_in_paper = "Fig 4C / S21B", published = elab(g[g$model == "sheridan_1.38.3", ]),
+    t(setNames(rep(NA, 4), mods)), note = paste(paste0(g$model, ": ", elab(g))[!grepl("sheridan", g$model)], collapse = "; "), check.names = FALSE) }
+for (pn_ in unique(panels$panel)) { g <- panels[panels$panel == pn_, ]
+  cl[[length(cl) + 1]] <- data.frame(item = paste(pn_, "correlation panel"), where_in_paper = pn_, published = g$panel_features[g$model == "sheridan_1.38.3"],
+    t(setNames(rep(NA, 4), mods)), note = paste(paste0(g$model, ": ", ifelse(g$same_as_published_call %in% TRUE, "same", "changes"),
+      ifelse(!is.na(g$note) & g$note != "", paste0(" (", g$note, ")"), ""))[!grepl("sheridan", g$model)], collapse = "; "), check.names = FALSE) }
+change_list <- bind_rows(cl)
+wcsv(change_list, "table7_case_B_change_list.csv")
+knitr::kable(change_list %>% select(-note))
+```
+
+# Session information
+
+```{r session}
+si <- list(`1.38.3` = cache(V38, "stored__gene_CA1")$sessionInfo, `1.46.0` = cache(V46, "exp_sbc__gene_CA1")$sessionInfo,
+           seurat_5.3.0 = th$sessionInfo, render = paste(capture.output(sessionInfo()), collapse = "\n"))
+for (n in names(si)) { cat("\n#####", n, "\n"); cat(si[[n]], "\n") }
+writeLines(unlist(lapply(names(si), function(n) c(paste("#####", n), si[[n]], ""))), file.path(OUT, "sessionInfo.txt"))
+```
